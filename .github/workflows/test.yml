@@ -23,5 +23,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run tests
-        run: npm test
+      - name: Run tests (with coverage)
+        run: npm run test:coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage/lcov.info
+          flags: unit
+          fail_ci_if_error: true
+          # If you did NOT install the Codecov GitHub App for this repo, uncomment the next line
+          # and add CODECOV_TOKEN to your repo secrets:
+          # token: ${{ secrets.CODECOV_TOKEN }}
