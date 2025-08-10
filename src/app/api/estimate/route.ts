@@ -1,436 +1,622 @@
-// src/app/api/estimate/route.ts
-import { NextResponse } from "next/server";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { NextRequest, NextResponse } from 'next/server';
+import * as HSD from '@/lib/hsDict';
 
-/* =========================
-   Types
-========================= */
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-type Destination = "usa" | "uk" | "eu";
-type ResolvedSource = "numeric" | "dict" | "none";
+/** ---------- Types ---------- */
+type RateComponent =
+  | { kind: 'pct'; value: number } // 0.05 = 5%
+  | { kind: 'amount'; value: number; per: string }; // $ per <unit> (kg, pair, doz, etc.)
 
-type Resolution =
-  | "numeric"     // numeric HS (6 or 10) provided by user
-  | "dictionary"  // matched via alias → 10-digit or other precise mapping
-  | "general-6"   // matched via alias or numeric but only 6-digit (general)
-  | "none";       // we couldn't resolve
+type RateType = 'advalorem' | 'specific' | 'compound';
 
-type BuildResponseArgs = {
-  product: string;
-  country: string;
-  price: number;
-  rate: number;
-  hsCode?: string;
-  description?: string;
-  resolvedFrom: ResolvedSource;
-  destination: Destination;
-  granularity?: "10" | "6" | "none";
+type HtsMini = {
+  hsCode: string;
+  description: string;
+  rate: number | null; // first ad-valorem % if present ("Free" => 0)
+  rateType: RateType;
+  components: RateComponent[]; // all parsed components from General rate
+  _rawGeneral?: string; // raw HTS "General rate of duty" (for debug/notes)
 };
 
-/* =========================
-   Curated HS alias dictionary (mostly 6-digit for portability)
-========================= */
+type Resolution = 'numeric' | 'hts' | 'dict' | 'none';
 
-// Replace your HS_DICT with this
-const HS_DICT: Array<{ code: string; label: string; aliases: string[] }> = [
-  /* =========================
-     APPAREL
-  ========================= */
-  { code: "6109", label: "T-shirts (knitted)", aliases: [
-    "tshirt","t shirt","t-shirt","tee","graphic tee","crew neck tee","v neck tee",
-    "mens tshirt","womens tshirt","kids tshirt","printed tee"
-  ]},
-  { code: "6110", label: "Sweaters / pullovers / hoodies (knit)", aliases: [
-    "sweater","pullover","jumper","hoodie","zip hoodie","cardigan","fleece","crew sweater","knit sweater"
-  ]},
-  { code: "6103", label: "Men’s coats/jackets (knit)", aliases: [
-    "mens jacket","mens coat","knit jacket","track jacket","zip jacket"
-  ]},
-  { code: "6104", label: "Women’s coats/jackets (knit)", aliases: [
-    "womens jacket","ladies jacket","ladies coat","knit jacket women"
-  ]},
-  { code: "6102", label: "Women’s suits/ensembles (knit)", aliases: [
-    "womens suit","ladies suit","knit suit women","co-ord knit"
-  ]},
-  { code: "6105", label: "Men’s shirts (knit)", aliases: [
-    "mens polo","mens knit shirt","polo shirt","polo"
-  ]},
-  { code: "6203", label: "Men’s suits/trousers (woven)", aliases: [
-    "mens trousers","mens pants","mens chinos","mens suit","mens blazer","men suit set"
-  ]},
-  { code: "6204", label: "Women’s suits/trousers (woven)", aliases: [
-    "womens trousers","ladies pants","ladies chinos","womens suit","women blazer"
-  ]},
-  { code: "6112", label: "Tracksuits & activewear (knit)", aliases: [
-    "tracksuit","track pants","joggers","yoga pants","gym leggings","running tights","sweatpants"
-  ]},
-  { code: "6505", label: "Hats & caps (knit or textile)", aliases: [
-    "cap","baseball cap","beanie","knit hat","bucket hat","snapback"
-  ]},
+/** ---------- Config ---------- */
+const HTS_BASE = 'https://hts.usitc.gov/reststop';
 
-  /* =========================
-     FOOTWEAR
-  ========================= */
-  { code: "6404", label: "Footwear with textile uppers", aliases: [
-    "shoes","sneakers","trainers","canvas shoes","running shoes","gym shoes","runners","athletic shoes"
-  ]},
-  { code: "6403", label: "Footwear with leather uppers", aliases: [
-    "leather shoes","oxfords","loafers","derby shoes","dress shoes","leather boots"
-  ]},
-  { code: "6402", label: "Footwear with rubber/plastic uppers", aliases: [
-    "rubber shoes","plastic shoes","clogs","slides","flip flops","sandals","water shoes","beach sandals"
-  ]},
-  { code: "6401", label: "Waterproof footwear (rubber/plastic)", aliases: [
-    "rain boots","wellies","galoshes","waterproof boots"
-  ]},
-  { code: "6405", label: "Other footwear", aliases: [
-    "house slippers","ballet flats","espadrilles","other shoes"
-  ]},
+/** Resolve hsLookup regardless of export style */
+const hsLookupFn: undefined | ((input: string) => any) = (() => {
+  const cand =
+    (HSD as any)?.hsLookup ??
+    (HSD as any)?.default ??
+    (typeof (HSD as any) === 'function' ? (HSD as any) : undefined);
+  return typeof cand === 'function' ? cand : undefined;
+})();
 
-  /* =========================
-     ELECTRONICS
-  ========================= */
-  { code: "847130", label: "Portable computers (laptops/tablets)", aliases: [
-    "laptop","notebook","macbook","chromebook","tablet pc","ultrabook"
-  ]},
-  { code: "847150", label: "Computer processing units", aliases: [
-    "desktop pc","computer tower","mini pc","pc barebone","cpu unit"
-  ]},
-  { code: "851762", label: "Networking equipment (routers/switches)", aliases: [
-    "wifi router","router","mesh router","network switch","ethernet switch","access point"
-  ]},
-  { code: "851810", label: "Microphones", aliases: [
-    "microphone","usb mic","podcast mic","condenser mic","dynamic mic","lapel mic"
-  ]},
-  { code: "851830", label: "Headphones/earphones", aliases: [
-    "headphones","earbuds","earphones","headset","wireless earbuds","gaming headset"
-  ]},
-  { code: "852852", label: "Monitors (LCD/LED)", aliases: [
-    "monitor","pc monitor","gaming monitor","lcd monitor","led monitor","display"
-  ]},
-  { code: "850760", label: "Lithium-ion batteries", aliases: [
-    "lithium battery","li-ion battery","phone battery","power bank","rechargeable battery"
-  ]},
-
-  /* =========================
-     BAGS & ACCESSORIES
-  ========================= */
-  { code: "4202", label: "Bags, luggage, cases", aliases: [
-    "backpack","handbag","purse","sling bag","tote bag","duffel bag","suitcase","carry on","briefcase",
-    "wallet","card holder","camera bag","cosmetic bag","makeup bag","pouch"
-  ]},
-  { code: "4203", label: "Leather apparel & accessories", aliases: [
-    "leather belt","leather gloves","leather jacket","belt","gloves (leather)"
-  ]},
-  { code: "6117", label: "Other made-up clothing accessories (knit)", aliases: [
-    "scarves","knit scarf","knit gloves","arm warmers","leg warmers","knit accessories"
-  ]},
-
-  /* =========================
-     KITCHENWARE & HOME
-  ========================= */
-  { code: "3924", label: "Table/kitchenware (plastic)", aliases: [
-    "plastic bowl","food container","tupperware","measuring cup","plastic plate","storage container"
-  ]},
-  { code: "7013", label: "Glassware (table/kitchen)", aliases: [
-    "wine glass","drinking glass","glass cup","glass tumbler","glass jar","vase (table)"
-  ]},
-  { code: "7323", label: "Table/kitchenware (steel)", aliases: [
-    "stainless bowl","steel pot","steel pan","cutlery","utensils","kitchen utensils","steel strainer"
-  ]},
-  { code: "7615", label: "Table/kitchenware (aluminium)", aliases: [
-    "aluminium pot","aluminum pan","aluminium tray","aluminum tray","aluminium kettle"
-  ]},
-  { code: "6912", label: "Ceramic table/kitchenware", aliases: [
-    "ceramic mug","ceramic plate","porcelain bowl","stoneware cup","ceramic dinnerware"
-  ]},
-
-  /* =========================
-     SPORTING GOODS
-  ========================= */
-  { code: "9506", label: "Sports equipment (general)", aliases: [
-    "fitness equipment","dumbbells","kettlebell","yoga mat","exercise band","basketball","football",
-    "tennis racket","skates","helmets (sport)","sports gear"
-  ]},
-  { code: "9507", label: "Fishing rods/tackle", aliases: [
-    "fishing rod","fishing reel","fishing tackle","lure","rod and reel"
-  ]},
-
-  /* =========================
-     OPTIONAL CATEGORIES (Tools / Toys / Jewellery)
-     — include if you want broader coverage now
-  ========================= */
-  { code: "8205", label: "Hand tools (spanners, pliers, etc.)", aliases: [
-    "hand tools","wrench","spanner","pliers","hammer","screwdriver set","multi tool"
-  ]},
-  { code: "9503", label: "Toys", aliases: [
-    "toy","plush toy","doll","action figure","lego","building blocks","kids toy","rc car"
-  ]},
-  { code: "7117", label: "Imitation jewellery", aliases: [
-    "fashion jewelry","costume jewelry","bracelet","necklace","earrings","anklet"
-  ]},
-  { code: "7113", label: "Articles of jewellery (precious metal)", aliases: [
-    "gold ring","silver necklace","gold bracelet","fine jewelry","wedding ring"
-  ]},
-
-  /* =========================
-     OPTICAL (demo 10-digit intact)
-  ========================= */
-  { code: "9004100000", label: "Sunglasses", aliases: [
-    "sunglasses","sunglass","shades"
-  ]},
-  { code: "900410", label: "Sunglasses (general)", aliases: [
-    "sunglasses 6 digit","sunglasses hs"
-  ]},
-];
-
-/* =========================
-   Demo US duty rates by 6-digit
-   (Real product-level rates are 8–10 digits; this is only to make the app feel tangible.)
-========================= */
-
-const DEMO_US_RATES_BY6: Record<string, number> = {
-  "6404": 0.12, // shoes (textile uppers) - demo
-  "6403": 0.08, // leather shoes - demo
-  "4202": 0.17, // bags / luggage - demo
-  "8518": 0.00, // headphones - demo
-  "3924": 0.03, // plastic kitchenware - demo
-  "7013": 0.05, // glassware - demo
-  "6109": 0.16, // t-shirts (knit) - demo
-  "6110": 0.14, // sweaters / pullovers - demo
-  "900410": 0.02, // sunglasses (general) - demo
-};
-
-/* =========================
-   Internal descriptions (avoid flaky external calls)
-========================= */
-const INTERNAL_HS_DESCRIPTIONS: Record<string, string> = {
-  "6404": "Footwear with outer soles of rubber or plastics and uppers of textile materials",
-  "6403": "Footwear with outer soles of rubber, plastics, leather or composition leather and uppers of leather",
-  "4202": "Trunks, suitcases, handbags and similar containers",
-  "8518": "Microphones, loudspeakers; headphones and earphones",
-  "3924": "Tableware, kitchenware and other household articles, of plastics",
-  "7013": "Glassware of a kind used for table, kitchen, toilet, office, indoor decoration",
-  "6109": "T-shirts, singlets and other vests, knitted or crocheted",
-  "6110": "Jerseys, pullovers, cardigans, waistcoats and similar articles, knitted",
-  "900410": "Sunglasses",
-  "9004100000": "Sunglasses",
-};
-
-/* =========================
-   Helpers
-========================= */
-
-function isNumericHs(s: string): false | "6" | "10" {
-  const raw = s.replace(/\D/g, "");
-  if (raw.length >= 10) return "10";
-  if (raw.length === 6) return "6";
-  return false;
-}
-
-function normalize(s: string) {
-  return s.trim().toLowerCase();
-}
-
-function lookupAlias(input: string): { code: string; label: string } | null {
-  const q = normalize(input);
-  for (const row of HS_DICT) {
-    if (row.aliases.some(a => normalize(a) === q)) return { code: row.code, label: row.label };
+/** In-memory cache (per server instance) */
+const cache = new Map<string, { t: number; data: any }>();
+const TTL_MS = 5 * 60 * 1000;
+function getCache(key: string) {
+  const v = cache.get(key);
+  if (!v) return null;
+  if (Date.now() - v.t > TTL_MS) {
+    cache.delete(key);
+    return null;
   }
-  // lenient contains match
-  for (const row of HS_DICT) {
-    if (row.aliases.some(a => q.includes(normalize(a)))) return { code: row.code, label: row.label };
+  return v.data;
+}
+function setCache(key: string, data: any) {
+  cache.set(key, { t: Date.now(), data });
+}
+
+/** ---------- utils ---------- */
+function normalizeNumeric(input: string): string {
+  const digits = (input || '').replace(/\D+/g, '');
+  if (!digits) return '';
+  if (digits.length >= 10) return digits.slice(0, 10);
+  return digits.padEnd(10, '0');
+}
+function looksNumeric(input: string): boolean {
+  return /\d/.test(input) && input.replace(/\D+/g, '').length >= 6;
+}
+function is10Digit(code: string) {
+  return /^\d{10}$/.test(code);
+}
+function formatHs(hs: string | null | undefined): string | null {
+  if (!hs) return null;
+  let d = String(hs).replace(/\D+/g, '');
+  if (!d) return null;
+  if (d.length < 10) d = d.padEnd(10, '0');
+  return `${d.slice(0, 4)}.${d.slice(4, 6)}.${d.slice(6, 10)}`;
+}
+
+/** ---------- Rate parsing ---------- */
+/** Smarter parser for HTS “General rate of duty”
+ * Supports:
+ *  - "Free" → { pct: 0 }
+ *  - Percentages: "5%", "2.5% ad val." (tolerant of footnotes like 2%*)
+ *  - Dollar-per-unit: $/kg, $/g (→ $/kg), $/lb (→ $/kg), $/pair, $/pr, $/prs
+ *  - Per dozen pairs: $/doz. pr., $/dozen pr(s) (→ $/pair ÷ 12)
+ *  - Per dozen (generic): $/doz., $/dozen
+ *  - Cents per unit: "7.5¢/kg", "2 c/kg", "2 c per doz. pr." (→ dollars)
+ *  - “per” wording: "$1 per kg", "2 c per doz. pr."
+ */
+function parseGeneralRateRich(
+  text?: string | null,
+): { type: RateType; components: RateComponent[]; raw: string } | null {
+  if (!text) return null;
+  const raw = String(text);
+  const t = raw.replace(/\s+/g, ' ').trim();
+
+  // Free
+  if (/^free\b/i.test(t)) {
+    return { type: 'advalorem', components: [{ kind: 'pct', value: 0 }], raw };
+  }
+
+  const components: RateComponent[] = [];
+
+  // Percentages (tolerant of footnotes like 2%*, 2%†)
+  for (const m of t.matchAll(/(\d+(?:\.\d+)?)\s*%/giu)) {
+    const v = parseFloat(m[1]);
+    if (!Number.isNaN(v)) components.push({ kind: 'pct', value: v / 100 });
+  }
+
+  // $/unit — allow dots/spaces in unit, e.g., "doz. pr."
+  for (const m of t.matchAll(/\$?\s*(\d+(?:\.\d+)?)\s*\/\s*([A-Za-z.\s0-9]+)\b/gi)) {
+    let val = parseFloat(m[1]);
+    let unit = (m[2] || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const unitNorm = unit.replace(/\./g, '').replace(/\s+/g, ' ').trim(); // "doz pr", "prs", etc.
+
+    // weights → per kg
+    if (/\bkg(s)?\b/.test(unitNorm)) {
+      components.push({ kind: 'amount', value: val, per: 'kg' });
+      continue;
+    }
+    if (/\bg(ram|ams)?\b/.test(unitNorm)) {
+      components.push({ kind: 'amount', value: val * 1000, per: 'kg' });
+      continue;
+    } // $/g → $/kg
+    if (/\b(lb|lbs|pound|pounds)\b/.test(unitNorm)) {
+      components.push({ kind: 'amount', value: val / 0.45359237, per: 'kg' });
+      continue;
+    } // $/lb → $/kg
+
+    // pairs
+    if (/\b(pair|pairs|pr|prs)\b/.test(unitNorm)) {
+      components.push({ kind: 'amount', value: val, per: 'pair' });
+      continue;
+    }
+
+    // dozen pairs → convert to per pair by /12
+    if (/\b(doz|dozen)\b/.test(unitNorm) && /\b(pr|prs|pair|pairs)\b/.test(unitNorm)) {
+      components.push({ kind: 'amount', value: val / 12, per: 'pair' });
+      continue;
+    }
+
+    // dozen (generic)
+    if (/\b(doz|dozen)\b/.test(unitNorm)) {
+      components.push({ kind: 'amount', value: val, per: 'dozen' });
+      continue;
+    }
+
+    // each/unit
+    if (/\b(no|unit|each|u)\b/.test(unitNorm)) {
+      components.push({ kind: 'amount', value: val, per: 'unit' });
+      continue;
+    }
+
+    // fallback
+    components.push({ kind: 'amount', value: val, per: unitNorm });
+  }
+
+  // $ per unit (e.g., "$1 per kg", "$0.50 per pair")
+  for (const m of t.matchAll(/\$\s*(\d+(?:\.\d+)?)\s*(?:per)\s*([A-Za-z.\s0-9]+)\b/gi)) {
+    const val = parseFloat(m[1]);
+    let unit = (m[2] || '').toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim();
+
+    if (/\bkg(s)?\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val, per: 'kg' });
+      continue;
+    }
+    if (/\b(pair|pairs|pr|prs)\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val, per: 'pair' });
+      continue;
+    }
+    if (/\b(doz|dozen)\b/.test(unit) && /\b(pr|prs|pair|pairs)\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val / 12, per: 'pair' });
+      continue;
+    }
+    if (/\b(doz|dozen)\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val, per: 'dozen' });
+      continue;
+    }
+    if (/\b(no|unit|each|u)\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val, per: 'unit' });
+      continue;
+    }
+    components.push({ kind: 'amount', value: val, per: unit });
+  }
+
+  // cents per unit with "c" (e.g., "2 c/kg", "2 c per doz. pr.")
+  for (const m of t.matchAll(/(\d+(?:\.\d+)?)\s*c\s*(?:per|\/)\s*([A-Za-z.\s0-9]+)\b/gi)) {
+    const val = parseFloat(m[1]) / 100; // convert cents to dollars
+    let unit = (m[2] || '').toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim();
+
+    if (/\bkg(s)?\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val, per: 'kg' });
+      continue;
+    }
+    if (/\b(pair|pairs|pr|prs)\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val, per: 'pair' });
+      continue;
+    }
+    if (/\b(doz|dozen)\b/.test(unit) && /\b(pr|prs|pair|pairs)\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val / 12, per: 'pair' });
+      continue;
+    }
+    if (/\b(doz|dozen)\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val, per: 'dozen' });
+      continue;
+    }
+    if (/\b(no|unit|each|u)\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val, per: 'unit' });
+      continue;
+    }
+    components.push({ kind: 'amount', value: val, per: unit });
+  }
+
+  // cents per unit (¢) → dollars
+  for (const m of t.matchAll(/(\d+(?:\.\d+)?)\s*¢\s*\/\s*([A-Za-z.\s0-9]+)\b/gi)) {
+    let val = parseFloat(m[1]) / 100;
+    let unit = (m[2] || '').toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim();
+
+    if (/\bkg(s)?\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val, per: 'kg' });
+      continue;
+    }
+    if (/\b(pair|pairs|pr|prs)\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val, per: 'pair' });
+      continue;
+    }
+    if (/\b(doz|dozen)\b/.test(unit) && /\b(pr|prs|pair|pairs)\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val / 12, per: 'pair' });
+      continue;
+    }
+    if (/\b(doz|dozen)\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val, per: 'dozen' });
+      continue;
+    }
+    if (/\b(no|unit|each|u)\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val, per: 'unit' });
+      continue;
+    }
+    components.push({ kind: 'amount', value: val, per: unit });
+  }
+
+  if (!components.length) return null;
+
+  const pctCount = components.filter((c) => c.kind === 'pct').length;
+  const amtCount = components.filter((c) => c.kind === 'amount').length;
+  const type: RateType =
+    pctCount > 0 && amtCount > 0 ? 'compound' : pctCount > 0 ? 'advalorem' : 'specific';
+
+  return { type, components, raw };
+}
+
+/** Try to find the general rate field across shapes */
+function extractGeneralRateField(rec: any): string | null {
+  if (typeof rec?.general_rate === 'string') return rec.general_rate;
+  if (typeof rec?.generalRate === 'string') return rec.generalRate;
+  if (typeof rec?.general === 'string') return rec.general;
+  if (rec?.rates && typeof rec.rates.general === 'string') return rec.rates.general;
+  for (const k of Object.keys(rec || {})) {
+    const v = rec[k];
+    if (typeof v !== 'string') continue;
+    const key = k.toLowerCase();
+    if (key.includes('general') && key.includes('duty')) return v;
+    if (key.includes('general rate')) return v;
   }
   return null;
 }
 
-function resolveHsFromInput(productRaw: string): {
-  code?: string;
-  source: ResolvedSource;
-  granularity: "10" | "6" | "none";
-  friendly?: string;
-} {
-  const product = productRaw.trim();
-  const numeric = isNumericHs(product);
-  if (numeric === "10") {
-    return { code: product.replace(/\D/g, "").slice(0, 10), source: "numeric", granularity: "10" };
+/** Convert raw HTS record to our mini shape */
+function toHtsMini(rec: any): HtsMini | null {
+  const hsCode =
+    rec?.htsno || rec?.htsno_str || rec?.hts_number || rec?.hts || rec?.number || rec?.htsno10;
+  const description =
+    rec?.desc || rec?.description || rec?.article || rec?.short_desc || rec?.item_description;
+  if (!hsCode || !description) return null;
+
+  const rawGeneral = extractGeneralRateField(rec);
+  const rich = parseGeneralRateRich(rawGeneral);
+  let rate: number | null = null;
+  let rateType: RateType = 'specific';
+  let components: RateComponent[] = [];
+
+  if (rich) {
+    rateType = rich.type;
+    components = rich.components;
+    const firstPct = components.find((c) => c.kind === 'pct') as
+      | { kind: 'pct'; value: number }
+      | undefined;
+    rate = firstPct ? firstPct.value : null;
   }
-  if (numeric === "6") {
-    return { code: product.replace(/\D/g, "").slice(0, 6), source: "numeric", granularity: "6" };
-  }
-
-  const alias = lookupAlias(product);
-  if (alias) {
-    return {
-      code: alias.code,
-      source: "dict",
-      granularity: alias.code.length >= 10 ? "10" : "6",
-      friendly: alias.label,
-    };
-  }
-  return { source: "none", granularity: "none" };
-}
-
-function pickUsRate(hsCode?: string): number | undefined {
-  if (!hsCode) return undefined;
-  const code = hsCode.replace(/\D/g, "");
-
-  // exact 10-digit demo override
-  if (code === "9004100000") return 0.02;
-
-  // 6-digit fallback
-  const c6 = code.slice(0, 6);
-  if (DEMO_US_RATES_BY6[c6] !== undefined) return DEMO_US_RATES_BY6[c6];
-
-  return undefined;
-}
-
-function hsDescriptionFromInternal(hsCode?: string): string | undefined {
-  if (!hsCode) return undefined;
-  const c = hsCode.replace(/\D/g, "");
-  return INTERNAL_HS_DESCRIPTIONS[c] ?? INTERNAL_HS_DESCRIPTIONS[c.slice(0, 6)];
-}
-
-function buildResponse(args: BuildResponseArgs) {
-  const duty = +(args.price * args.rate).toFixed(2);
-
-  const resolution: Resolution =
-    args.resolvedFrom === "numeric"
-      ? "numeric"
-      : args.resolvedFrom === "dict"
-      ? args.granularity === "6"
-        ? "general-6"
-        : "dictionary"
-      : "none";
 
   return {
-    duty,
-    rate: args.rate,
-    resolution,
-    breakdown: {
-      product: args.product,
-      country: args.country,
-      price: args.price,
-      hsCode: args.hsCode,
-      description: args.description,
-    },
-    notes: `Destination: ${args.destination.toUpperCase()}. Placeholder ${(args.rate * 100).toFixed(
-      1
-    )}% rate.`,
+    hsCode: String(hsCode).replace(/\D+/g, '').padEnd(10, '0').slice(0, 10),
+    description: String(description).replace(/\s+/g, ' ').trim(),
+    rate,
+    rateType,
+    components,
+    _rawGeneral: rawGeneral ?? undefined,
   };
 }
 
-/* =========================
-   POST /api/estimate
-========================= */
+/** Simple keyword score */
+function scoreKeywordHit(mini: HtsMini, q: string): number {
+  const s = mini.description.toLowerCase();
+  const ql = q.toLowerCase();
+  let score = 0;
+  if (new RegExp(`\\b${ql}\\b`).test(s)) score += 10;
+  if (s.includes(ql)) score += 4;
+  if (mini.rate !== null) score += 3;
+  if (is10Digit(mini.hsCode)) score += 2;
+  score += Math.max(0, 2 - Math.min(2, Math.floor(mini.description.length / 60)));
+  return score;
+}
 
-export async function POST(req: Request) {
+/** ---------- HTS calls (cached) ---------- */
+async function htsExportByCode(numericInput: string): Promise<HtsMini[] | null> {
+  const code10 = normalizeNumeric(numericInput);
+  if (!code10) return null;
+
+  const key = `export:${code10}`;
+  const cached = getCache(key);
+  if (cached) return cached;
+
+  const url = `${HTS_BASE}/exportList?from=${encodeURIComponent(code10)}&to=${encodeURIComponent(code10)}&format=JSON`;
+  const res = await fetch(url, { cache: 'no-store', headers: { Accept: 'application/json' } });
+  if (!res.ok) return null;
+
+  const data: any = await res.json().catch(() => null);
+  if (!data) return null;
+
+  const rows: any[] = Array.isArray(data)
+    ? data
+    : Array.isArray(data.results)
+      ? data.results
+      : Array.isArray(data.data)
+        ? data.data
+        : [];
+
+  const minis = rows.map(toHtsMini).filter(Boolean) as HtsMini[];
+  const out = minis.length ? minis : null;
+  setCache(key, out);
+  return out;
+}
+
+async function htsSearchByKeyword(keyword: string): Promise<HtsMini[] | null> {
+  const q = keyword.toLowerCase().trim();
+  const key = `search:${q}`;
+  const cached = getCache(key);
+  if (cached) return cached;
+
+  const url = `${HTS_BASE}/search?keyword=${encodeURIComponent(keyword)}`;
+  const res = await fetch(url, { cache: 'no-store', headers: { Accept: 'application/json' } });
+  if (!res.ok) return null;
+
+  const data: any = await res.json().catch(() => null);
+  if (!data) return null;
+
+  const rows: any[] = Array.isArray(data) ? data : Array.isArray(data.results) ? data.results : [];
+
+  const minis = rows.map(toHtsMini).filter(Boolean) as HtsMini[];
+  const out = minis.length ? minis : null;
+  setCache(key, out);
+  return out;
+}
+
+/** ---------- Dict fallback ---------- */
+function dictFallback(input: string) {
   try {
-    const body = (await req.json()) as {
-      product?: string;
-      price?: number;
-      country?: string;
-      to?: Destination;
+    if (!hsLookupFn) return null;
+    const hit = hsLookupFn(input); // { hsCode, description, usDutyRate, resolution }
+    if (!hit) return null;
+    return {
+      hsCode: hit.hsCode,
+      description: hit.description,
+      rate: typeof hit.usDutyRate === 'number' ? hit.usDutyRate : null,
+      rateType: (typeof hit.usDutyRate === 'number' ? 'advalorem' : 'specific') as RateType,
+      components:
+        typeof hit.usDutyRate === 'number'
+          ? ([{ kind: 'pct', value: hit.usDutyRate }] as RateComponent[])
+          : [],
+      _dictResolution: hit.resolution,
     };
-
-    const product = (body.product ?? "").trim();
-    const country = (body.country ?? "").trim();
-    const price = Number(body.price);
-    const destination: Destination = (body.to ?? "usa").toLowerCase() as Destination;
-
-    if (!product || !country || !Number.isFinite(price) || price < 0) {
-      return NextResponse.json(
-        { error: "Invalid input. Provide product, country, and non-negative price." },
-        { status: 400 }
-      );
-    }
-
-    const resolved = resolveHsFromInput(product);
-    let hsCode = resolved.code;
-    let description = hsDescriptionFromInternal(hsCode) || resolved.friendly;
-
-    // Destination-specific rate selection (demo)
-    let rate = 0.05;
-    if (destination === "usa") {
-      const maybe = pickUsRate(hsCode);
-      if (maybe !== undefined) rate = maybe;
-    } else if (destination === "uk") {
-      rate = 0.05;
-    } else if (destination === "eu") {
-      rate = 0.05;
-    }
-
-    // growth: log misses so we can add aliases later
-    if (resolved.source === "none") {
-      console.warn("[HS_MISS]", { product, country, destination });
-    }
-
-    return NextResponse.json(
-      buildResponse({
-        product,
-        country,
-        price,
-        rate,
-        hsCode,
-        description,
-        resolvedFrom: resolved.source,
-        destination,
-        granularity: resolved.granularity,
-      })
-    );
-  } catch (err) {
-    console.error(err);
-    return NextResponse.json({ error: "Bad request" }, { status: 400 });
+  } catch {
+    return null;
   }
 }
 
-/* =========================
-   GET /api/estimate?product=...&price=...&country=...&to=usa
-   (handy for quick tests)
-========================= */
+/** ---------- Duty calculator ---------- */
+// Ad-valorem now uses TOTAL shipment value: priceUSD * (qty ?? 1)
+function computeDutyUSD(args: {
+  components: RateComponent[];
+  priceUSD: number; // price per unit
+  qty?: number | null; // units/pairs
+  weightKg?: number | null; // total weight
+  notes: string[];
+}) {
+  const { components, priceUSD } = args;
+  let duty = 0;
 
-export async function GET(req: Request) {
+  const units = args.qty != null && Number.isFinite(args.qty) && args.qty > 0 ? args.qty : 1;
+
+  // ad valorem on total declared value
+  for (const c of components) {
+    if (c.kind === 'pct') duty += priceUSD * units * c.value;
+  }
+
+  // specific units
+  for (const c of components) {
+    if (c.kind !== 'amount') continue;
+    const per = (c.per || '').toLowerCase();
+
+    if (per === 'kg') {
+      if (args.weightKg && args.weightKg > 0) duty += c.value * args.weightKg;
+      else args.notes.push('This line charges per kilogram. Add weight (kg) to include that part.');
+      continue;
+    }
+
+    if (per === 'pair') {
+      if (args.qty && args.qty > 0) duty += c.value * args.qty;
+      else args.notes.push('This line charges per pair. Add quantity to include that part.');
+      continue;
+    }
+
+    if (per === 'unit') {
+      if (args.qty && args.qty > 0) duty += c.value * args.qty;
+      else args.notes.push('This line charges per unit. Add quantity to include that part.');
+      continue;
+    }
+
+    if (per === 'dozen') {
+      if (args.qty && args.qty > 0) duty += c.value * (args.qty / 12);
+      else args.notes.push('This line charges per dozen. Add quantity (we’ll divide by 12).');
+      continue;
+    }
+
+    // unknown unit -> warn
+    args.notes.push(`Specific duty uses unsupported unit "/${per}" — not included in total yet.`);
+  }
+
+  return Number(duty.toFixed(2));
+}
+
+/** ---------- Core handler ---------- */
+async function handleEstimate(params: {
+  input?: string;
+  product?: string;
+  price?: any;
+  country?: string;
+  qty?: any;
+  weightKg?: any;
+}) {
+  const input = String(params.input ?? params.product ?? '').trim();
+  const product = String(params.product ?? input ?? '').trim();
+  const country = String(params.country ?? 'China');
+  const price = Number(params.price ?? 0);
+  const qty = params.qty == null ? null : Number(params.qty);
+  const weightKg = params.weightKg == null ? null : Number(params.weightKg);
+
+  if (!input) {
+    return { error: "Provide 'input' (keyword or HS code)", status: 400 };
+  }
+
+  let chosen: HtsMini | null = null;
+  let resolution: Resolution = 'none';
+  const notes: string[] = [];
+  let alternates: HtsMini[] = [];
+
+  try {
+    // 1) Numeric → exportList; fallback to numeric search
+    if (looksNumeric(input)) {
+      const minisExport = await htsExportByCode(input);
+      if (minisExport?.length) {
+        const exact = minisExport.find((m) => is10Digit(m.hsCode)) ?? minisExport[0];
+        chosen = exact ?? null;
+        resolution = 'numeric';
+      } else {
+        const minisSearch = await htsSearchByKeyword(input);
+        if (minisSearch?.length) {
+          const digits = input.replace(/\D+/g, '');
+          const pref = minisSearch
+            .filter((m) => is10Digit(m.hsCode) && m.hsCode.startsWith(digits.slice(0, 6)))
+            .sort((a, b) => (a.rate === null ? 1 : 0) - (b.rate === null ? 1 : 0)); // prefer ad valorem
+          chosen = pref[0] ?? minisSearch[0] ?? null;
+          resolution = 'numeric';
+        }
+      }
+    }
+
+    // 2) Keyword → search (collect alternates)
+    if (!chosen && !looksNumeric(input)) {
+      const minis = await htsSearchByKeyword(input);
+      if (minis?.length) {
+        const scored = minis
+          .map((m) => ({ m, s: scoreKeywordHit(m, input) }))
+          .sort((a, b) => b.s - a.s);
+        chosen = scored[0]?.m ?? null;
+        resolution = 'hts';
+        alternates = scored.slice(1, 6).map((x) => x.m);
+      }
+    }
+
+    // 3) Local dict fallback
+    if (!chosen) {
+      const fb = dictFallback(input);
+      if (fb) {
+        chosen = {
+          hsCode: fb.hsCode,
+          description: fb.description,
+          rate: fb.rate,
+          rateType: fb.rate != null ? 'advalorem' : 'specific',
+          components: fb.rate != null ? [{ kind: 'pct', value: fb.rate }] : [],
+        };
+        resolution = 'dict';
+      }
+    }
+
+    // 4) No match
+    if (!chosen) {
+      return {
+        body: {
+          duty: null,
+          rate: null,
+          rateType: null as any,
+          components: [] as RateComponent[],
+          resolution: 'none' as Resolution,
+          breakdown: {
+            product,
+            country,
+            price,
+            hsCode: null,
+            hsCodeFormatted: null,
+            description: null,
+            qty,
+            weightKg,
+          },
+          alternates: [] as any[],
+          notes: ['No HTS or dictionary match found.'],
+        },
+        status: 200,
+      };
+    }
+
+    // If nothing parsed yet, include the raw text so we can see what HTS returned
+    if (chosen.components.length === 0 && chosen.rate == null && (chosen as any)._rawGeneral) {
+      notes.push(`HTS General (raw): ${(chosen as any)._rawGeneral}`);
+    }
+
+    // Compute duty
+    let duty: number | null = null;
+    if (chosen.components.length === 0 && chosen.rate == null) {
+      notes.push('No parseable General rate of duty for this line.');
+    } else {
+      duty = computeDutyUSD({
+        components: chosen.components,
+        priceUSD: price,
+        qty,
+        weightKg,
+        notes,
+      });
+    }
+
+    if (chosen.rateType !== 'advalorem') {
+      notes.push(
+        'This line includes specific or compound duties. Provide quantity and/or weight (kg) for the most accurate total.',
+      );
+    }
+
+    return {
+      body: {
+        duty,
+        rate: chosen.rate,
+        rateType: chosen.rateType,
+        components: chosen.components,
+        resolution,
+        breakdown: {
+          product,
+          country,
+          price,
+          hsCode: chosen.hsCode,
+          hsCodeFormatted: formatHs(chosen.hsCode),
+          description: chosen.description,
+          qty,
+          weightKg,
+        },
+        alternates: alternates.map((a) => ({
+          hsCode: a.hsCode,
+          hsCodeFormatted: formatHs(a.hsCode),
+          description: a.description,
+          rate: a.rate,
+          rateType: a.rateType,
+        })),
+        notes,
+      },
+      status: 200,
+    };
+  } catch (err: any) {
+    return { error: err?.message ?? 'Unexpected error', status: 500 };
+  }
+}
+
+/** ---------- API handlers ---------- */
+export async function POST(req: NextRequest) {
+  const raw = await req.text();
+  let body: any = {};
+  try {
+    body = raw ? JSON.parse(raw) : {};
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
+  }
+  const out = await handleEstimate(body);
+  if ('error' in out) return NextResponse.json({ error: out.error }, { status: out.status });
+  return NextResponse.json(out.body, { status: out.status });
+}
+
+export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
-  const product = (searchParams.get("product") ?? "").trim();
-  const country = (searchParams.get("country") ?? "").trim();
-  const price = Number(searchParams.get("price"));
-  const destination = (searchParams.get("to") ?? "usa").toLowerCase() as Destination;
-
-  if (!product || !country || !Number.isFinite(price) || price < 0) {
-    return NextResponse.json(
-      { error: "Invalid query. Provide product, country, and non-negative price." },
-      { status: 400 }
-    );
-  }
-
-  const resolved = resolveHsFromInput(product);
-  let hsCode = resolved.code;
-  let description = hsDescriptionFromInternal(hsCode) || resolved.friendly;
-
-  let rate = 0.05;
-  if (destination === "usa") {
-    const maybe = pickUsRate(hsCode);
-    if (maybe !== undefined) rate = maybe;
-  } else if (destination === "uk") {
-    rate = 0.05;
-  } else if (destination === "eu") {
-    rate = 0.05;
-  }
-
-  if (resolved.source === "none") {
-    console.warn("[HS_MISS]", { product, country, destination });
-  }
-
-  return NextResponse.json(
-    buildResponse({
-      product,
-      country,
-      price,
-      rate,
-      hsCode,
-      description,
-      resolvedFrom: resolved.source,
-      destination,
-      granularity: resolved.granularity,
-    })
-  );
+  const out = await handleEstimate({
+    input: searchParams.get('input') ?? undefined,
+    product: searchParams.get('product') ?? undefined,
+    price: searchParams.get('price') ?? undefined,
+    country: searchParams.get('country') ?? undefined,
+    qty: searchParams.get('qty') ?? undefined,
+    weightKg: searchParams.get('weightKg') ?? undefined,
+  });
+  if ('error' in out) return NextResponse.json({ error: out.error }, { status: out.status });
+  return NextResponse.json(out.body, { status: out.status });
 }

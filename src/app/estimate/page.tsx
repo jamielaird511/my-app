@@ -1,53 +1,60 @@
-"use client";
+'use client';
 
-import { useEffect, useMemo, useState } from "react";
-import type { FormEvent, ReactNode } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
-import NavBar from "../../components/NavBar";
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 
-/* ----------------------------- Types ----------------------------- */
-
-type Resolution = "numeric" | "dict" | "hmrc" | "none";
+type Resolution = 'none' | 'dict' | 'numeric' | 'hts';
+type RateComponent =
+  | { kind: 'pct'; value: number }
+  | { kind: 'amount'; value: number; per: string };
 
 type ApiResult = {
-  duty: number;
-  rate: number; // e.g., 0.05 for 5%
-  resolution?: Resolution;
+  duty: number | null;
+  rate: number | null; // 0 => Free
+  rateType: 'advalorem' | 'specific' | 'compound' | null;
+  components: RateComponent[];
+  resolution: Resolution;
   breakdown: {
-    product: string;
-    country: string;
-    price: number;
-    hsCode?: string;
-    description?: string;
+    product: string | null;
+    country: string | null;
+    price: number | null; // per unit
+    hsCode?: string | null;
+    hsCodeFormatted?: string | null;
+    description?: string | null;
+    qty?: number | null;
+    weightKg?: number | null;
   };
-  notes: string;
+  alternates?: Array<{
+    hsCode: string;
+    hsCodeFormatted?: string | null;
+    description: string;
+    rate: number | null;
+    rateType: 'advalorem' | 'specific' | 'compound';
+  }>;
+  notes?: string[];
 };
 
-/* -------------------------- Utilities --------------------------- */
-
-const currency = new Intl.NumberFormat("en-US", {
-  style: "currency",
-  currency: "USD",
+const currency = new Intl.NumberFormat('en-US', {
+  style: 'currency',
+  currency: 'USD',
   maximumFractionDigits: 2,
 });
 
-function titleCaseFirst(s: string) {
-  if (!s) return s;
+function titleCase(s: string) {
   return s
-    .split(" ")
-    .filter(Boolean)
-    .map((w) => w[0]?.toUpperCase() + w.slice(1).toLowerCase())
-    .join(" ");
+    .trim()
+    .replace(/\s+/g, ' ')
+    .split(' ')
+    .map((w) => (w ? w[0]!.toUpperCase() + w.slice(1).toLowerCase() : ''))
+    .join(' ');
 }
-
-/* ---------------------------- UI Bits --------------------------- */
 
 function Toast({
   kind,
   message,
   onClose,
 }: {
-  kind: "success" | "error";
+  kind: 'success' | 'error';
   message: string;
   onClose: () => void;
 }) {
@@ -56,233 +63,331 @@ function Toast({
     return () => clearTimeout(id);
   }, [onClose]);
 
-  const base = "fixed top-4 right-4 z-50 rounded-md px-4 py-2 shadow text-sm";
-  const style =
-    kind === "success" ? "bg-green-600 text-white" : "bg-red-600 text-white";
+  const base = 'fixed top-4 right-4 z-50 rounded-md px-4 py-2 shadow text-sm';
+  const style = kind === 'success' ? 'bg-green-600 text-white' : 'bg-red-600 text-white';
   return <div className={`${base} ${style}`}>{message}</div>;
 }
 
-function WarningAlert({ children }: { children: ReactNode }) {
+function ResolutionBadge({ r }: { r: Resolution }) {
+  const map: Record<Resolution, { label: string; className: string }> = {
+    numeric: { label: 'HTS (Numeric)', className: 'bg-blue-100 text-blue-700' },
+    hts: { label: 'HTS (Keyword)', className: 'bg-indigo-100 text-indigo-700' },
+    dict: { label: 'Dictionary', className: 'bg-gray-100 text-gray-700' },
+    none: { label: 'No Match', className: 'bg-amber-100 text-amber-800' },
+  };
+  const s = map[r] ?? map.none;
   return (
-    <div className="mb-4 rounded-lg border border-yellow-300 bg-yellow-50 px-4 py-3 text-sm text-yellow-900">
-      <div className="font-medium mb-1">
-        We couldn’t match your product to an HS code.
-      </div>
-      <div>{children}</div>
-    </div>
+    <span
+      className={`rounded-full text-xs px-3 py-1 shadow ${s.className}`}
+      title={`Resolution: ${s.label}`}
+    >
+      {s.label}
+    </span>
   );
 }
 
-/* --------------------------- Main Page -------------------------- */
+function rateToText(rate: number | null | undefined) {
+  if (rate === 0) return 'Free';
+  if (rate == null) return '—';
+  const pct = rate * 100;
+  return `${pct.toFixed(pct < 1 ? 2 : 1)}%`;
+}
+
+function componentsText(components: RateComponent[]) {
+  if (!components?.length) return '—';
+  return components
+    .map((c) => (c.kind === 'pct' ? `${(c.value * 100).toFixed(2)}%` : `$${c.value}/${c.per}`))
+    .join(' + ');
+}
 
 export default function EstimatePage() {
   const search = useSearchParams();
   const router = useRouter();
 
-  // seed from query for shareable URLs
-  const [product, setProduct] = useState(search.get("product") ?? "");
-  const [price, setPrice] = useState<string>(search.get("price") ?? "");
-  const [country, setCountry] = useState(search.get("country") ?? "");
-  const [destination, setDestination] = useState<"usa" | "uk" | "eu">(
-    (search.get("to") as "usa" | "uk" | "eu") ?? "usa"
+  // seed from query params (shareable) + localStorage (sticky UX)
+  const [product, setProduct] = useState(search.get('product') ?? '');
+  const [price, setPrice] = useState<string>(
+    search.get('price') ??
+      (typeof window !== 'undefined' ? (localStorage.getItem('est_price') ?? '') : ''),
+  );
+  const [country, setCountry] = useState(
+    search.get('country') ??
+      (typeof window !== 'undefined' ? (localStorage.getItem('est_country') ?? '') : ''),
+  );
+  const [qty, setQty] = useState<string>(
+    search.get('qty') ??
+      (typeof window !== 'undefined' ? (localStorage.getItem('est_qty') ?? '') : ''),
+  );
+  const [weightKg, setWeightKg] = useState<string>(
+    search.get('weightKg') ??
+      (typeof window !== 'undefined' ? (localStorage.getItem('est_weight') ?? '') : ''),
   );
 
   const [loading, setLoading] = useState(false);
-  const [toast, setToast] = useState<
-    { kind: "success" | "error"; msg: string } | null
-  >(null);
+  const [autoUpdating, setAutoUpdating] = useState(false);
+  const [toast, setToast] = useState<{ kind: 'success' | 'error'; msg: string } | null>(null);
   const [result, setResult] = useState<ApiResult | null>(null);
 
   const priceNum = useMemo(() => Number(price), [price]);
+  const qtyNum = useMemo(() => (qty === '' ? null : Number(qty)), [qty]);
+  const weightNum = useMemo(() => (weightKg === '' ? null : Number(weightKg)), [weightKg]);
+
+  const hasHsCode = useMemo(() => /^\d{6}(\d{4})?$/.test(product.trim()), [product]);
+  const isMissingHsCode = product.trim().length > 0 && !hasHsCode;
+
   const canSubmit =
     !!product.trim() &&
     !!country.trim() &&
     Number.isFinite(priceNum) &&
+    price !== '' &&
     priceNum >= 0 &&
-    !loading;
+    !loading &&
+    !autoUpdating;
 
-  // Keep URL in sync with inputs (for shareable links)
+  // persist some fields locally (UX)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (country.trim()) localStorage.setItem('est_country', country.trim());
+    if (price !== '') localStorage.setItem('est_price', String(priceNum));
+    if (qty !== '') localStorage.setItem('est_qty', String(qtyNum));
+    if (weightKg !== '') localStorage.setItem('est_weight', String(weightNum));
+  }, [country, price, priceNum, qty, qtyNum, weightKg, weightNum]);
+
+  // shareable URL (US-only; no destination param)
   useEffect(() => {
     const params = new URLSearchParams();
-    if (product.trim()) params.set("product", product.trim());
-    if (country.trim()) params.set("country", country.trim());
-    if (Number.isFinite(priceNum) && price !== "")
-      params.set("price", String(priceNum));
-    if (destination) params.set("to", destination);
+    if (product.trim()) params.set('product', product.trim());
+    if (country.trim()) params.set('country', country.trim());
+    if (Number.isFinite(priceNum) && price !== '') params.set('price', String(priceNum));
+    if (qtyNum != null && Number.isFinite(qtyNum)) params.set('qty', String(qtyNum));
+    if (weightNum != null && Number.isFinite(weightNum)) params.set('weightKg', String(weightNum));
     const qs = params.toString();
-    router.replace(`/estimate${qs ? `?${qs}` : ""}`, { scroll: false });
+    router.replace(`/estimate${qs ? `?${qs}` : ''}`, { scroll: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [product, country, priceNum, destination]);
+  }, [product, country, priceNum, qtyNum, weightNum]);
 
-  async function handleEstimate(e: FormEvent) {
+  async function callEstimate(payload: Record<string, any>) {
+    const res = await fetch('/api/estimate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = (await res.json()) as ApiResult | { error?: string };
+    if (!res.ok) throw new Error((data as any)?.error || 'Request failed');
+    return data as ApiResult;
+  }
+
+  async function handleEstimate(e: React.FormEvent) {
     e.preventDefault();
     if (!canSubmit) return;
 
     setResult(null);
     try {
       setLoading(true);
-      const res = await fetch("/api/estimate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          product: product.trim(),
-          country: country.trim(),
-          price: priceNum,
-          destination,
-        }),
+      const data = await callEstimate({
+        input: product.trim(),
+        product: product.trim(),
+        country: country.trim(),
+        price: priceNum,
+        qty: qtyNum ?? undefined,
+        weightKg: weightNum ?? undefined,
       });
-
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error || "Request failed");
-      setResult(data as ApiResult);
-      setToast({ kind: "success", msg: "Estimate ready" });
+      setResult(data);
+      setToast({ kind: 'success', msg: 'Estimate ready' });
     } catch (err: any) {
-      setToast({
-        kind: "error",
-        msg: err.message || "Couldn’t get an estimate",
-      });
+      setToast({ kind: 'error', msg: err.message || 'Couldn’t get an estimate' });
     } finally {
       setLoading(false);
     }
   }
 
-  const destLabel =
-    destination === "usa"
-      ? "United States"
-      : destination === "uk"
-      ? "United Kingdom"
-      : "European Union";
+  // Auto-rerun when qty/weight/price change (400ms debounce) – keeps totals fresh
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!result) return;
+    if (!product.trim() || !country.trim() || !(Number.isFinite(priceNum) && price !== '')) return;
 
-  // Small inline source tag after HS code (not near header)
-  function InlineSourceTag({ resolution }: { resolution?: Resolution }) {
-    if (resolution === "dict")
-      return (
-        <span className="ml-2 text-xs text-gray-500">(via dictionary)</span>
-      );
-    if (resolution === "hmrc")
-      return (
-        <span className="ml-2 text-xs text-gray-500">(via HMRC search)</span>
-      );
-    return null; // for numeric/none -> nothing
+    setAutoUpdating(true);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(async () => {
+      try {
+        const data = await callEstimate({
+          input: result.breakdown.hsCode || product.trim(), // force numeric if we have it
+          product: product.trim(),
+          country: country.trim(),
+          price: priceNum,
+          qty: qtyNum ?? undefined,
+          weightKg: weightNum ?? undefined,
+        });
+        setResult(data);
+      } catch (e: any) {
+        setToast({ kind: 'error', msg: e?.message || 'Auto-update failed' });
+      } finally {
+        setAutoUpdating(false);
+      }
+    }, 400);
+
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [qtyNum, weightNum, priceNum]);
+
+  // Use an alternate HS line: update input + URL + recompute
+  async function useAlternate(hsCode: string) {
+    try {
+      setProduct(hsCode);
+      setLoading(true);
+      const data = await callEstimate({
+        input: hsCode,
+        product: hsCode,
+        country: country.trim(),
+        price: priceNum,
+        qty: qtyNum ?? undefined,
+        weightKg: weightNum ?? undefined,
+      });
+      setResult(data);
+      const params = new URLSearchParams(window.location.search);
+      params.set('product', hsCode);
+      router.replace(`/estimate?${params}`, { scroll: false });
+      setToast({ kind: 'success', msg: `Using ${hsCode}` });
+    } catch (e: any) {
+      setToast({ kind: 'error', msg: e?.message || 'Failed to use alternate' });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const money = (n: number | null | undefined) =>
+    n == null || Number.isNaN(n) ? '—' : currency.format(n);
+
+  const totalDeclared =
+    result?.breakdown?.price != null
+      ? (result.breakdown.price ?? 0) *
+        (result.breakdown.qty != null &&
+        Number.isFinite(result.breakdown.qty) &&
+        (result.breakdown.qty as number) > 0
+          ? (result.breakdown.qty as number)
+          : 1)
+      : null;
+
+  // Print/PDF – clean print layout
+  function handlePrint() {
+    window.print();
   }
 
   return (
-    <>
-      <NavBar />
-      <main className="min-h-screen bg-gray-50 flex items-start justify-center px-6 py-10">
-        <div className="max-w-lg w-full bg-white p-8 rounded-2xl shadow">
-          <h1 className="text-2xl font-bold text-gray-900 mb-6">
-            Duty Estimator
-          </h1>
+    <main className="min-h-screen bg-gray-50 flex items-center justify-center px-6">
+      <div className="max-w-xl w-full bg-white p-8 rounded-2xl shadow print:shadow-none print:max-w-none print:w-full print:p-0">
+        <h1 className="text-2xl font-bold text-gray-900 mb-6 print:mb-3">Duty Estimator</h1>
 
-          <form onSubmit={handleEstimate} className="space-y-4">
-            {/* Product */}
+        <form onSubmit={handleEstimate} className="space-y-5 print:hidden">
+          {/* Product */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700">Product</label>
+            <input
+              autoFocus
+              type="text"
+              placeholder="e.g., Sunglasses, 6-digit HS code, or 10-digit HS code"
+              value={product}
+              onChange={(e) => setProduct(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            {isMissingHsCode ? (
+              <p className="mt-1 text-xs text-amber-600">
+                Tip: Paste a 6-digit or 10-digit HS code for more accurate rates.
+              </p>
+            ) : (
+              <p className="mt-1 text-xs text-gray-500">
+                Keywords, a 6-digit HS code, or a 10-digit HS code all work.
+              </p>
+            )}
+          </div>
+
+          {/* Price */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700">Price per unit (USD)</label>
+            <div className="mt-1 flex">
+              <span className="inline-flex items-center rounded-l-lg border border-r-0 border-gray-300 bg-gray-50 px-3 text-gray-600">
+                USD
+              </span>
+              <input
+                type="number"
+                inputMode="decimal"
+                step="0.01"
+                min="0"
+                placeholder="e.g., 49.99"
+                value={price}
+                onChange={(e) => setPrice(e.target.value)}
+                className="w-full rounded-r-lg border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            {!Number.isFinite(priceNum) || price === '' || priceNum < 0 ? (
+              <p className="mt-1 text-xs text-red-600">Enter a non-negative number.</p>
+            ) : (
+              <p className="mt-1 text-xs text-gray-500">We’ll use {currency.format(priceNum)}.</p>
+            )}
+          </div>
+
+          {/* Country */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700">Country of origin</label>
+            <input
+              type="text"
+              placeholder="e.g., China"
+              value={country}
+              onChange={(e) => setCountry(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            <p className="mt-1 text-xs text-gray-500">Where is it manufactured?</p>
+          </div>
+
+          {/* Optional qty/weight */}
+          <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-sm font-medium text-gray-700">
-                Product
+                Quantity (units/pairs){' '}
+                {autoUpdating && <span className="text-xs text-gray-500">(recalculating…)</span>}
               </label>
               <input
-                autoFocus
-                type="text"
-                placeholder="e.g., Sunglasses or 10-digit HS code"
-                value={product}
-                onChange={(e) => setProduct(e.target.value)}
+                type="number"
+                inputMode="numeric"
+                min="0"
+                step="1"
+                placeholder="optional"
+                value={qty}
+                onChange={(e) => setQty(e.target.value)}
                 className="mt-1 w-full rounded-lg border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
-              {(!product || result?.resolution === "none") ? (
-                <p className="mt-1 text-xs text-yellow-700">
-                  Tip: Paste a 10-digit HS code if you have one. It gives the
-                  most accurate rate.
-                </p>
-              ) : (
-                <p className="mt-1 text-xs text-gray-500">
-                  Keywords or a 10-digit HS code both work.
-                </p>
-              )}
             </div>
-
-            {/* Price */}
             <div>
               <label className="block text-sm font-medium text-gray-700">
-                Price per unit (USD)
-              </label>
-              <div className="mt-1 flex">
-                <span className="inline-flex items-center rounded-l-lg border border-r-0 border-gray-300 bg-gray-50 px-3 text-gray-600">
-                  USD
-                </span>
-                <input
-                  type="number"
-                  inputMode="decimal"
-                  step="0.01"
-                  min="0"
-                  placeholder="e.g., 49.99"
-                  value={price}
-                  onChange={(e) => setPrice(e.target.value)}
-                  className="w-full rounded-r-lg border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-              {!Number.isFinite(priceNum) || priceNum < 0 ? (
-                <p className="mt-1 text-xs text-red-600">
-                  Enter a non-negative number.
-                </p>
-              ) : (
-                <p className="mt-1 text-xs text-gray-500">
-                  We’ll use {currency.format(priceNum)}.
-                </p>
-              )}
-            </div>
-
-            {/* Destination */}
-            <div>
-              <label className="block text-sm font-medium text-gray-700">
-                Importing to
-              </label>
-              <select
-                value={destination}
-                onChange={(e) =>
-                  setDestination(e.target.value as "usa" | "uk" | "eu")
-                }
-                className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
-              >
-                <option value="usa">United States</option>
-                <option value="uk">United Kingdom</option>
-                <option value="eu">European Union</option>
-              </select>
-              <p className="mt-1 text-xs text-gray-500">
-                Rates and taxes depend on destination.
-              </p>
-            </div>
-
-            {/* Country of origin */}
-            <div>
-              <label className="block text-sm font-medium text-gray-700">
-                Country of origin
+                Weight (kg){' '}
+                {autoUpdating && <span className="text-xs text-gray-500">(recalculating…)</span>}
               </label>
               <input
-                type="text"
-                placeholder="e.g., China"
-                value={country}
-                onChange={(e) => setCountry(e.target.value)}
+                type="number"
+                inputMode="decimal"
+                min="0"
+                step="0.01"
+                placeholder="optional"
+                value={weightKg}
+                onChange={(e) => setWeightKg(e.target.value)}
                 className="mt-1 w-full rounded-lg border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
-              <p className="mt-1 text-xs text-gray-500">
-                Where is it manufactured?
-              </p>
             </div>
+          </div>
 
-            {/* Actions */}
-            <div className="flex items-center gap-2">
-              <button
-                type="submit"
-                disabled={!canSubmit}
-                className="flex-1 rounded-lg bg-blue-600 px-4 py-2 text-white font-medium transition hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-              >
-                {loading && (
-                  <svg
-                    className="animate-spin h-4 w-4"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                  >
+          {/* Actions */}
+          <div className="flex items-center gap-2">
+            <button
+              type="submit"
+              disabled={!canSubmit}
+              className="flex-1 rounded-lg bg-blue-600 px-4 py-2 text-white font-medium transition hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+            >
+              {loading ? (
+                <>
+                  <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
                     <circle
                       className="opacity-25"
                       cx="12"
@@ -297,94 +402,212 @@ export default function EstimatePage() {
                       d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"
                     />
                   </svg>
-                )}
-                {loading ? "Calculating…" : "Estimate Duty"}
-              </button>
+                  Calculating…
+                </>
+              ) : (
+                'Estimate Duty'
+              )}
+            </button>
 
-              <button
-                type="button"
-                onClick={async () => {
-                  await navigator.clipboard.writeText(window.location.href);
-                  setToast({ kind: "success", msg: "Link copied" });
-                }}
-                className="rounded-lg border px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
-              >
-                Copy link
-              </button>
+            <button
+              type="button"
+              onClick={async () => {
+                await navigator.clipboard.writeText(window.location.href);
+                setToast({ kind: 'success', msg: 'Link copied' });
+              }}
+              className="rounded-lg border px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+            >
+              Copy link
+            </button>
+
+            <button
+              type="button"
+              onClick={handlePrint}
+              className="rounded-lg border px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+              title="Save or print a PDF of this estimate"
+            >
+              Save as PDF
+            </button>
+          </div>
+        </form>
+
+        {/* Result card */}
+        {result && (
+          <div className="mt-6 rounded-2xl border p-4 relative">
+            <div className="absolute -top-3 right-3 print:hidden">
+              <ResolutionBadge r={result.resolution} />
             </div>
-          </form>
 
-          {/* Warning when no HS match (fallback rate) */}
-          {result && result.resolution === "none" && (
-            <WarningAlert>
-              We used a temporary {(result.rate * 100).toFixed(1)}% rate for
-              this estimate. For better accuracy, try a more specific keyword
-              (e.g., “running shoes” → “footwear textile uppers”) or paste a
-              10-digit HS code.
-            </WarningAlert>
-          )}
+            <h2 className="font-semibold mb-2">Estimated Costs</h2>
 
-          {/* Result */}
-          {result && (
-            <div className="mt-6 rounded-2xl border p-4">
-              <h2 className="font-semibold mb-2">Estimated Costs</h2>
+            <div className="text-gray-800 space-y-1">
+              <div>
+                Product:{' '}
+                <span className="font-medium">
+                  {result.breakdown.product ? titleCase(result.breakdown.product) : '—'}
+                </span>
+              </div>
+              <div>
+                Country:{' '}
+                <span className="font-medium">
+                  {result.breakdown.country ? titleCase(result.breakdown.country) : '—'}
+                </span>
+              </div>
+              <div>
+                Importing to: <span className="font-medium">United States</span>
+              </div>
 
-              <div className="text-gray-800 space-y-1">
-                <div>
-                  Product:{" "}
-                  <span className="font-medium">
-                    {titleCaseFirst(result.breakdown.product)}
-                  </span>
-                </div>
-                <div>
-                  Country:{" "}
-                  <span className="font-medium">
-                    {titleCaseFirst(result.breakdown.country)}
-                  </span>
-                </div>
-                <div>
-                  Importing to: <span className="font-medium">{destLabel}</span>
-                </div>
-
-                {result.breakdown.hsCode && (
+              {(result.breakdown.hsCodeFormatted ||
+                result.breakdown.hsCode ||
+                result.breakdown.description) && (
+                <div className="flex items-center gap-2 flex-wrap">
                   <div>
-                    HS code:{" "}
-                    <span className="font-mono">{result.breakdown.hsCode}</span>
-                    {result.breakdown.description ? (
-                      <> — {result.breakdown.description}</>
-                    ) : null}
-                    {/* Inline source note ONLY here */}
-                    <InlineSourceTag resolution={result.resolution} />
+                    HS code:{' '}
+                    <span className="font-mono">
+                      {result.breakdown.hsCodeFormatted || result.breakdown.hsCode || '—'}
+                    </span>
+                    {result.breakdown.description ? <> — {result.breakdown.description}</> : null}
+                  </div>
+                  {result.breakdown.hsCode && (
+                    <div className="print:hidden">
+                      <button
+                        type="button"
+                        onClick={() => navigator.clipboard.writeText(result.breakdown.hsCode!)}
+                        className="rounded border px-2 py-0.5 text-xs hover:bg-gray-50"
+                      >
+                        Copy HS
+                      </button>
+                      <a
+                        className="rounded border px-2 py-0.5 text-xs hover:bg-gray-50"
+                        target="_blank"
+                        rel="noreferrer"
+                        href={`https://hts.usitc.gov/?query=${result.breakdown.hsCode}`}
+                      >
+                        View on USITC
+                      </a>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div>Declared price (per unit): {money(result.breakdown.price)}</div>
+
+              {result.breakdown.qty != null && Number.isFinite(result.breakdown.qty) && (
+                <div className="text-sm text-gray-700">
+                  Total declared value: {money(totalDeclared)}
+                  <span className="text-gray-500">
+                    {' '}
+                    ({money(result.breakdown.price)} × {result.breakdown.qty})
+                  </span>
+                </div>
+              )}
+
+              <div>Duty rate: {rateToText(result.rate)}</div>
+              <div className="text-sm text-gray-600">
+                Components: {componentsText(result.components)}
+              </div>
+
+              <div className="mt-2 border-t pt-2">
+                <span className="text-sm text-gray-600">
+                  {money(result.breakdown.price)}
+                  {result.breakdown.qty != null && Number.isFinite(result.breakdown.qty)
+                    ? ` × ${result.breakdown.qty} × ${rateToText(result.rate)} =`
+                    : ` × ${rateToText(result.rate)} =`}
+                </span>{' '}
+                <span className="font-semibold">{money(result.duty)}</span>
+                {(result.breakdown.qty != null || result.breakdown.weightKg != null) && (
+                  <div className="text-sm text-gray-600">
+                    (Qty: {result.breakdown.qty ?? '—'}, Weight: {result.breakdown.weightKg ?? '—'}{' '}
+                    kg)
                   </div>
                 )}
-
-                <div>Price: {currency.format(result.breakdown.price)}</div>
-                <div>Duty rate: {(result.rate * 100).toFixed(1)}%</div>
-
-                <div className="mt-1 border-t pt-2">
-                  <span className="text-sm text-gray-600">
-                    {currency.format(result.breakdown.price)} ×{" "}
-                    {(result.rate * 100).toFixed(1)}% =
-                  </span>{" "}
-                  <span className="font-semibold">
-                    {currency.format(result.duty)}
-                  </span>
-                </div>
-
-                <p className="text-gray-600 mt-2">{result.notes}</p>
               </div>
-            </div>
-          )}
-        </div>
 
-        {toast && (
-          <Toast
-            kind={toast.kind}
-            message={toast.msg}
-            onClose={() => setToast(null)}
-          />
+              {Array.isArray(result.notes) && result.notes.length > 0 && (
+                <div className="mt-3 rounded-lg bg-amber-50 p-3 text-amber-900 text-sm">
+                  <ul className="list-disc pl-5 space-y-1">
+                    {result.notes.map((n, i) => (
+                      <li key={i}>{n}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+
+            {/* Alternates */}
+            {result.alternates && result.alternates.length > 0 && (
+              <div className="mt-4 rounded-lg border p-3 print:hidden">
+                <div className="font-medium mb-2">Other close HTS lines</div>
+                <ul className="space-y-2">
+                  {result.alternates.slice(0, 5).map((alt, i) => (
+                    <li key={i} className="flex items-start justify-between gap-3">
+                      <div className="text-sm">
+                        <div className="font-mono">
+                          {alt.hsCodeFormatted || alt.hsCode}{' '}
+                          <span className="text-gray-400">({alt.rateType})</span>
+                        </div>
+                        <div className="text-gray-700">{alt.description}</div>
+                        <div className="text-gray-600 text-xs">
+                          Rate:{' '}
+                          {alt.rate === 0
+                            ? 'Free'
+                            : alt.rate == null
+                              ? '—'
+                              : `${(alt.rate * 100).toFixed(2)}%`}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => useAlternate(alt.hsCode)}
+                        className="shrink-0 rounded border px-2 py-1 text-xs hover:bg-gray-50"
+                      >
+                        Use this
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
         )}
-      </main>
-    </>
+
+        {/* Trust & timestamp footer */}
+        <div className="mt-6 text-xs text-gray-500 text-center print:mt-2">
+          Rates via USITC HTS REST API (General column). Calculated {new Date().toLocaleString()}.
+          <span className="block">
+            Does not include special programs or additional duties (e.g., Section 301).
+          </span>
+        </div>
+      </div>
+
+      {toast && <Toast kind={toast.kind} message={toast.msg} onClose={() => setToast(null)} />}
+
+      <style jsx global>{`
+        @media print {
+          body,
+          html {
+            background: #fff !important;
+          }
+          .print:hidden {
+            display: none !important;
+          }
+          .print:max-w-none {
+            max-width: none !important;
+          }
+          .print:w-full {
+            width: 100% !important;
+          }
+          .print:p-0 {
+            padding: 0 !important;
+          }
+          .print:mb-3 {
+            margin-bottom: 0.75rem !important;
+          }
+          .print:shadow-none {
+            box-shadow: none !important;
+          }
+        }
+      `}</style>
+    </main>
   );
 }
