@@ -1,27 +1,20 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextRequest, NextResponse } from 'next/server';
 import * as HSD from '@/lib/hsDict';
+import {
+  RateComponent,
+  RateType,
+  HtsMini,
+  parseGeneralRateRich,
+  computeDutyUSD,
+  looksNumeric,
+  is10Digit,
+  normalizeNumeric,
+  formatHs,
+} from '@/lib/duty';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-
-/** ---------- Types ---------- */
-type RateComponent =
-  | { kind: 'pct'; value: number } // 0.05 = 5%
-  | { kind: 'amount'; value: number; per: string }; // $ per <unit> (kg, pair, doz, etc.)
-
-type RateType = 'advalorem' | 'specific' | 'compound';
-
-type HtsMini = {
-  hsCode: string;
-  description: string;
-  rate: number | null; // first ad-valorem % if present ("Free" => 0)
-  rateType: RateType;
-  components: RateComponent[]; // all parsed components from General rate
-  _rawGeneral?: string; // raw HTS "General rate of duty" (for debug/notes)
-};
-
-type Resolution = 'numeric' | 'hts' | 'dict' | 'none';
 
 /** ---------- Config ---------- */
 const HTS_BASE = 'https://hts.usitc.gov/reststop';
@@ -51,221 +44,7 @@ function setCache(key: string, data: any) {
   cache.set(key, { t: Date.now(), data });
 }
 
-/** ---------- utils ---------- */
-function normalizeNumeric(input: string): string {
-  const digits = (input || '').replace(/\D+/g, '');
-  if (!digits) return '';
-  if (digits.length >= 10) return digits.slice(0, 10);
-  return digits.padEnd(10, '0');
-}
-function looksNumeric(input: string): boolean {
-  return /\d/.test(input) && input.replace(/\D+/g, '').length >= 6;
-}
-function is10Digit(code: string) {
-  return /^\d{10}$/.test(code);
-}
-function formatHs(hs: string | null | undefined): string | null {
-  if (!hs) return null;
-  let d = String(hs).replace(/\D+/g, '');
-  if (!d) return null;
-  if (d.length < 10) d = d.padEnd(10, '0');
-  return `${d.slice(0, 4)}.${d.slice(4, 6)}.${d.slice(6, 10)}`;
-}
-
-/** ---------- Rate parsing ---------- */
-/** Smarter parser for HTS “General rate of duty”
- * Supports:
- *  - "Free" → { pct: 0 }
- *  - Percentages: "5%", "2.5% ad val." (tolerant of footnotes like 2%*)
- *  - Dollar-per-unit: $/kg, $/g (→ $/kg), $/lb (→ $/kg), $/pair, $/pr, $/prs
- *  - Per dozen pairs: $/doz. pr., $/dozen pr(s), $/dz pr. (→ $/pair ÷ 12)
- *  - Per dozen (generic): $/doz., $/dozen, $/dz
- *  - Per gross: $/gross (→ $/unit ÷ 144)
- *  - Cents per unit: "7.5¢/kg", "2 c/kg", "2 c per doz. pr." (→ dollars)
- *  - “per” wording: "$1 per kg", "2 c per doz. pr."
- */
-function parseGeneralRateRich(
-  text?: string | null,
-): { type: RateType; components: RateComponent[]; raw: string } | null {
-  if (!text) return null;
-  const raw = String(text);
-  const t = raw.replace(/\s+/g, ' ').trim();
-
-  // Free
-  if (/^free\b/i.test(t)) {
-    return { type: 'advalorem', components: [{ kind: 'pct', value: 0 }], raw };
-  }
-
-  const components: RateComponent[] = [];
-
-  // Percentages (tolerant of footnotes like 2%*, 2%†)
-  for (const m of t.matchAll(/(\d+(?:\.\d+)?)\s*%/giu)) {
-    const v = parseFloat(m[1]);
-    if (!Number.isNaN(v)) components.push({ kind: 'pct', value: v / 100 });
-  }
-
-  // $/unit — allow dots/spaces in unit, e.g., "doz. pr."
-  for (const m of t.matchAll(/\$?\s*(\d+(?:\.\d+)?)\s*\/\s*([A-Za-z.\s0-9]+)\b/gi)) {
-    let val = parseFloat(m[1]);
-    let unit = (m[2] || '').toLowerCase().replace(/\s+/g, ' ').trim();
-    const unitNorm = unit.replace(/\./g, '').replace(/\s+/g, ' ').trim(); // "doz pr", "prs", "dz pr", "gross", etc.
-
-    // weights → per kg
-    if (/\bkg(s)?\b/.test(unitNorm)) {
-      components.push({ kind: 'amount', value: val, per: 'kg' });
-      continue;
-    }
-    if (/\bg(ram|ams)?\b/.test(unitNorm)) {
-      components.push({ kind: 'amount', value: val * 1000, per: 'kg' });
-      continue;
-    } // $/g → $/kg
-    if (/\b(lb|lbs|pound|pounds)\b/.test(unitNorm)) {
-      components.push({ kind: 'amount', value: val / 0.45359237, per: 'kg' });
-      continue;
-    } // $/lb → $/kg
-
-    // pairs
-    if (/\b(pair|pairs|pr|prs)\b/.test(unitNorm)) {
-      components.push({ kind: 'amount', value: val, per: 'pair' });
-      continue;
-    }
-
-    // dozen pairs → convert to per pair by /12  (doz/dozen/dz + pr/prs/pair/pairs)
-    if (/\b(doz|dozen|dz)\b/.test(unitNorm) && /\b(pr|prs|pair|pairs)\b/.test(unitNorm)) {
-      components.push({ kind: 'amount', value: val / 12, per: 'pair' });
-      continue;
-    }
-
-    // dozen (generic)
-    if (/\b(doz|dozen|dz)\b/.test(unitNorm)) {
-      components.push({ kind: 'amount', value: val, per: 'dozen' });
-      continue;
-    }
-
-    // gross (144 units) → per unit ÷ 144
-    if (/\bgross\b/.test(unitNorm)) {
-      components.push({ kind: 'amount', value: val / 144, per: 'unit' });
-      continue;
-    }
-
-    // each/unit
-    if (/\b(no|unit|each|u)\b/.test(unitNorm)) {
-      components.push({ kind: 'amount', value: val, per: 'unit' });
-      continue;
-    }
-
-    // fallback
-    components.push({ kind: 'amount', value: val, per: unitNorm });
-  }
-
-  // $ per unit (e.g., "$1 per kg", "$0.50 per pair")
-  for (const m of t.matchAll(/\$\s*(\d+(?:\.\d+)?)\s*(?:per)\s*([A-Za-z.\s0-9]+)\b/gi)) {
-    const val = parseFloat(m[1]);
-    let unit = (m[2] || '').toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim();
-
-    if (/\bkg(s)?\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val, per: 'kg' });
-      continue;
-    }
-    if (/\b(pair|pairs|pr|prs)\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val, per: 'pair' });
-      continue;
-    }
-    // dozen pairs → convert to per pair by /12
-    if (/\b(doz|dozen|dz)\b/.test(unit) && /\b(pr|prs|pair|pairs)\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val / 12, per: 'pair' });
-      continue;
-    }
-    if (/\b(doz|dozen|dz)\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val, per: 'dozen' });
-      continue;
-    }
-    if (/\bgross\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val / 144, per: 'unit' });
-      continue;
-    }
-    if (/\b(no|unit|each|u)\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val, per: 'unit' });
-      continue;
-    }
-    components.push({ kind: 'amount', value: val, per: unit });
-  }
-
-  // cents per unit with "c" (e.g., "2 c/kg", "2 c per doz. pr.")
-  for (const m of t.matchAll(/(\d+(?:\.\d+)?)\s*c\s*(?:per|\/)\s*([A-Za-z.\s0-9]+)\b/gi)) {
-    const val = parseFloat(m[1]) / 100; // convert cents to dollars
-    let unit = (m[2] || '').toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim();
-
-    if (/\bkg(s)?\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val, per: 'kg' });
-      continue;
-    }
-    if (/\b(pair|pairs|pr|prs)\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val, per: 'pair' });
-      continue;
-    }
-    if (/\b(doz|dozen|dz)\b/.test(unit) && /\b(pr|prs|pair|pairs)\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val / 12, per: 'pair' });
-      continue;
-    }
-    if (/\b(doz|dozen|dz)\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val, per: 'dozen' });
-      continue;
-    }
-    if (/\bgross\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val / 144, per: 'unit' });
-      continue;
-    }
-    if (/\b(no|unit|each|u)\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val, per: 'unit' });
-      continue;
-    }
-    components.push({ kind: 'amount', value: val, per: unit });
-  }
-
-  // cents per unit (¢) → dollars
-  for (const m of t.matchAll(/(\d+(?:\.\d+)?)\s*¢\s*\/\s*([A-Za-z.\s0-9]+)\b/gi)) {
-    let val = parseFloat(m[1]) / 100;
-    let unit = (m[2] || '').toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim();
-
-    if (/\bkg(s)?\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val, per: 'kg' });
-      continue;
-    }
-    if (/\b(pair|pairs|pr|prs)\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val, per: 'pair' });
-      continue;
-    }
-    if (/\b(doz|dozen|dz)\b/.test(unit) && /\b(pr|prs|pair|pairs)\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val / 12, per: 'pair' });
-      continue;
-    }
-    if (/\b(doz|dozen|dz)\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val, per: 'dozen' });
-      continue;
-    }
-    if (/\bgross\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val / 144, per: 'unit' });
-      continue;
-    }
-    if (/\b(no|unit|each|u)\b/.test(unit)) {
-      components.push({ kind: 'amount', value: val, per: 'unit' });
-      continue;
-    }
-    components.push({ kind: 'amount', value: val, per: unit });
-  }
-
-  if (!components.length) return null;
-
-  const pctCount = components.filter((c) => c.kind === 'pct').length;
-  const amtCount = components.filter((c) => c.kind === 'amount').length;
-  const type: RateType =
-    pctCount > 0 && amtCount > 0 ? 'compound' : pctCount > 0 ? 'advalorem' : 'specific';
-
-  return { type, components, raw };
-}
-
-/** Try to find the general rate field across shapes */
+/** ---------- HTS helpers ---------- */
 function extractGeneralRateField(rec: any): string | null {
   if (typeof rec?.general_rate === 'string') return rec.general_rate;
   if (typeof rec?.generalRate === 'string') return rec.generalRate;
@@ -281,7 +60,6 @@ function extractGeneralRateField(rec: any): string | null {
   return null;
 }
 
-/** Convert raw HTS record to our mini shape */
 function toHtsMini(rec: any): HtsMini | null {
   const hsCode =
     rec?.htsno || rec?.htsno_str || rec?.hts_number || rec?.hts || rec?.number || rec?.htsno10;
@@ -314,7 +92,6 @@ function toHtsMini(rec: any): HtsMini | null {
   };
 }
 
-/** Simple keyword score */
 function scoreKeywordHit(mini: HtsMini, q: string): number {
   const s = mini.description.toLowerCase();
   const ql = q.toLowerCase();
@@ -336,7 +113,9 @@ async function htsExportByCode(numericInput: string): Promise<HtsMini[] | null> 
   const cached = getCache(key);
   if (cached) return cached;
 
-  const url = `${HTS_BASE}/exportList?from=${encodeURIComponent(code10)}&to=${encodeURIComponent(code10)}&format=JSON`;
+  const url = `${HTS_BASE}/exportList?from=${encodeURIComponent(code10)}&to=${encodeURIComponent(
+    code10,
+  )}&format=JSON`;
   const res = await fetch(url, { cache: 'no-store', headers: { Accept: 'application/json' } });
   if (!res.ok) return null;
 
@@ -371,7 +150,6 @@ async function htsSearchByKeyword(keyword: string): Promise<HtsMini[] | null> {
   if (!data) return null;
 
   const rows: any[] = Array.isArray(data) ? data : Array.isArray(data.results) ? data.results : [];
-
   const minis = rows.map(toHtsMini).filter(Boolean) as HtsMini[];
   const out = minis.length ? minis : null;
   setCache(key, out);
@@ -400,61 +178,6 @@ function dictFallback(input: string) {
   }
 }
 
-/** ---------- Duty calculator ---------- */
-// Ad-valorem now uses TOTAL shipment value: priceUSD * (qty ?? 1)
-function computeDutyUSD(args: {
-  components: RateComponent[];
-  priceUSD: number; // price per unit
-  qty?: number | null; // units/pairs
-  weightKg?: number | null; // total weight
-  notes: string[];
-}) {
-  const { components, priceUSD } = args;
-  let duty = 0;
-
-  const units = args.qty != null && Number.isFinite(args.qty) && args.qty > 0 ? args.qty : 1;
-
-  // ad valorem on total declared value
-  for (const c of components) {
-    if (c.kind === 'pct') duty += priceUSD * units * c.value;
-  }
-
-  // specific units
-  for (const c of components) {
-    if (c.kind !== 'amount') continue;
-    const per = (c.per || '').toLowerCase();
-
-    if (per === 'kg') {
-      if (args.weightKg && args.weightKg > 0) duty += c.value * args.weightKg;
-      else args.notes.push('This line charges per kilogram. Add weight (kg) to include that part.');
-      continue;
-    }
-
-    if (per === 'pair') {
-      if (args.qty && args.qty > 0) duty += c.value * args.qty;
-      else args.notes.push('This line charges per pair. Add quantity to include that part.');
-      continue;
-    }
-
-    if (per === 'unit') {
-      if (args.qty && args.qty > 0) duty += c.value * args.qty;
-      else args.notes.push('This line charges per unit. Add quantity to include that part.');
-      continue;
-    }
-
-    if (per === 'dozen') {
-      if (args.qty && args.qty > 0) duty += c.value * (args.qty / 12);
-      else args.notes.push('This line charges per dozen. Add quantity (we’ll divide by 12).');
-      continue;
-    }
-
-    // unknown unit -> warn
-    args.notes.push(`Specific duty uses unsupported unit "/${per}" — not included in total yet.`);
-  }
-
-  return Number(duty.toFixed(2));
-}
-
 /** ---------- Core handler ---------- */
 async function handleEstimate(params: {
   input?: string;
@@ -476,7 +199,7 @@ async function handleEstimate(params: {
   }
 
   let chosen: HtsMini | null = null;
-  let resolution: Resolution = 'none';
+  let resolution: 'numeric' | 'hts' | 'dict' | 'none' = 'none';
   const notes: string[] = [];
   let alternates: HtsMini[] = [];
 
@@ -537,7 +260,7 @@ async function handleEstimate(params: {
           rate: null,
           rateType: null as any,
           components: [] as RateComponent[],
-          resolution: 'none' as Resolution,
+          resolution: 'none' as const,
           breakdown: {
             product,
             country,
