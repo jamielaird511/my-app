@@ -1,10 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 
 type ApiResult = {
   duty: number;
-  rate: number; // e.g. 0.05
+  rate: number; // 0.05
   breakdown: { product: string; country: string; price: number };
   notes: string;
 };
@@ -15,36 +16,82 @@ const currency = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 2,
 });
 
+// super tiny toast
+function Toast({
+  kind,
+  message,
+  onClose,
+}: {
+  kind: "success" | "error";
+  message: string;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const id = setTimeout(onClose, 2500);
+    return () => clearTimeout(id);
+  }, [onClose]);
+
+  const base =
+    "fixed top-4 right-4 z-50 rounded-md px-4 py-2 shadow text-sm";
+  const style =
+    kind === "success"
+      ? "bg-green-600 text-white"
+      : "bg-red-600 text-white";
+  return <div className={`${base} ${style}`}>{message}</div>;
+}
+
 export default function EstimatePage() {
-  const [product, setProduct] = useState("");
-  const [price, setPrice] = useState<string>("");
-  const [country, setCountry] = useState("");
+  const search = useSearchParams();
+  const router = useRouter();
+
+  // seed state from query params (so link is sharable)
+  const [product, setProduct] = useState(search.get("product") ?? "");
+  const [price, setPrice] = useState<string>(search.get("price") ?? "");
+  const [country, setCountry] = useState(search.get("country") ?? "");
+
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ kind: "success" | "error"; msg: string } | null>(null);
   const [result, setResult] = useState<ApiResult | null>(null);
 
   const priceNum = useMemo(() => Number(price), [price]);
   const canSubmit =
     !!product.trim() && !!country.trim() && Number.isFinite(priceNum) && priceNum >= 0 && !loading;
 
+  // keep URL in sync when values change (lightweight, debounced-ish)
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (product.trim()) params.set("product", product.trim());
+    if (country.trim()) params.set("country", country.trim());
+    if (Number.isFinite(priceNum) && price !== "") params.set("price", String(priceNum));
+    const qs = params.toString();
+    router.replace(`/estimate${qs ? `?${qs}` : ""}`, { scroll: false });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [product, country, priceNum]);
+
   async function handleEstimate(e: React.FormEvent) {
     e.preventDefault();
     if (!canSubmit) return;
 
-    setError(null);
     setResult(null);
     try {
       setLoading(true);
       const res = await fetch("/api/estimate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ product: product.trim(), country: country.trim(), price: priceNum }),
+        body: JSON.stringify({
+          product: product.trim(),
+          country: country.trim(),
+          price: priceNum,
+        }),
       });
+
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || "Request failed");
+
       setResult(data as ApiResult);
+      setToast({ kind: "success", msg: "Estimate ready" });
     } catch (err: any) {
-      setError(err.message || "Couldn’t get an estimate.");
+      setToast({ kind: "error", msg: err.message || "Couldn’t get an estimate" });
     } finally {
       setLoading(false);
     }
@@ -91,10 +138,7 @@ export default function EstimatePage() {
             {!Number.isFinite(priceNum) || priceNum < 0 ? (
               <p className="mt-1 text-xs text-red-600">Enter a non-negative number.</p>
             ) : (
-              <p className="mt-1 text-xs text-gray-500">
-                We’ll use {currency.format(Number.isFinite(priceNum) ? priceNum : 0)} in the
-                estimate.
-              </p>
+              <p className="mt-1 text-xs text-gray-500">We’ll use ${priceNum.toFixed(2)}.</p>
             )}
           </div>
 
@@ -111,35 +155,35 @@ export default function EstimatePage() {
             <p className="mt-1 text-xs text-gray-500">Where is it manufactured?</p>
           </div>
 
-          {/* Submit */}
-          <button
-            type="submit"
-            disabled={!canSubmit}
-            className="w-full rounded-lg bg-blue-600 px-4 py-2 text-white font-medium transition hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-          >
-            {loading && (
-              <svg
-                className="animate-spin h-4 w-4 text-white"
-                viewBox="0 0 24 24"
-                fill="none"
-                xmlns="http://www.w3.org/2000/svg"
-              >
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path
-                  className="opacity-75"
-                  fill="currentColor"
-                  d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"
-                />
-              </svg>
-            )}
-            {loading ? "Calculating…" : "Estimate Duty"}
-          </button>
+          {/* Actions */}
+          <div className="flex items-center gap-2">
+            <button
+              type="submit"
+              disabled={!canSubmit}
+              className="flex-1 rounded-lg bg-blue-600 px-4 py-2 text-white font-medium transition hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+            >
+              {loading && (
+                <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+                </svg>
+              )}
+              {loading ? "Calculating…" : "Estimate Duty"}
+            </button>
 
-          {error && (
-            <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-              {error}
-            </div>
-          )}
+            {/* Copy sharable link */}
+            <button
+              type="button"
+              onClick={async () => {
+                const url = window.location.href;
+                await navigator.clipboard.writeText(url);
+                setToast({ kind: "success", msg: "Link copied" });
+              }}
+              className="rounded-lg border px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+            >
+              Copy link
+            </button>
+          </div>
         </form>
 
         {/* Result */}
@@ -166,6 +210,14 @@ export default function EstimatePage() {
           </div>
         )}
       </div>
+
+      {toast && (
+        <Toast
+          kind={toast.kind}
+          message={toast.msg}
+          onClose={() => setToast(null)}
+        />
+      )}
     </main>
   );
 }
