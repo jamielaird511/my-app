@@ -1,286 +1,399 @@
 // src/app/api/estimate/route.ts
 import { NextResponse } from "next/server";
 
-type Payload = { product?: string; price?: number; country?: string; destination?: string };
+/* =========================
+   Types
+========================= */
 
-/* ---------------------- HMRC Trade Tariff lookups ---------------------- */
+type Destination = "usa" | "uk" | "eu";
+type ResolvedSource = "numeric" | "dict" | "none";
 
-const TT_BASE = "https://www.trade-tariff.service.gov.uk/uk/api";
-const TT_HEADERS = { Accept: "application/vnd.hmrc.2.0+json" };
+type Resolution =
+  | "numeric"     // numeric HS (6 or 10) provided by user
+  | "dictionary"  // matched via alias → 10-digit or other precise mapping
+  | "general-6"   // matched via alias or numeric but only 6-digit (general)
+  | "none";       // we couldn't resolve
 
-/** Tiny normalize: lowercase, strip punctuation/extra spaces */
-function norm(s: string) {
-  return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-}
-
-/** Levenshtein distance + similarity (0..1). */
-function lev(a: string, b: string) {
-  if (a === b) return 0;
-  const m = a.length, n = b.length;
-  if (!m) return n;
-  if (!n) return m;
-  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,
-        dp[i][j - 1] + 1,
-        dp[i - 1][j - 1] + cost
-      );
-    }
-  }
-  return dp[m][n];
-}
-function sim(a: string, b: string) {
-  const d = lev(a, b);
-  return 1 - d / Math.max(a.length || 1, b.length || 1);
-}
-
-/** Curated aliases → HS codes (mix of 4-digit headings + a few 10-digit). */
-const HS_DICT: Array<{ code: string; label: string; aliases: string[] }> = [
-  // Apparel
-  { code: "6109", label: "T-shirts (knitted)", aliases: ["t shirt", "t-shirt", "tshirt", "tee", "cotton tshirt", "graphic tee"] },
-  { code: "6110", label: "Sweaters / pullovers", aliases: ["jumper", "sweater", "pullover", "cardigan", "hoodie"] },
-  { code: "6203", label: "Mens suits/jackets/trousers", aliases: ["mens pants", "mens trousers", "mens suit", "blazer"] },
-  { code: "6204", label: "Womens suits/dresses/skirts", aliases: ["dress", "skirt", "blouse", "womens suit"] },
-  { code: "6104", label: "Womens dresses (knitted)", aliases: ["knit dress", "jersey dress"] },
-
-  // Footwear & accessories
-  { code: "6404", label: "Footwear (textile uppers)", aliases: ["shoes", "sneakers", "trainers", "canvas shoes"] },
-  { code: "4202", label: "Bags, luggage, cases", aliases: ["backpack", "handbag", "suitcase", "luggage", "wallet"] },
-  { code: "4203", label: "Leather apparel & gloves", aliases: ["leather gloves", "leather jacket", "work gloves"] },
-
-  // Electronics
-  { code: "8517", label: "Phones & network devices", aliases: ["iphone", "phone", "cellphone", "mobile", "router", "modem"] },
-  { code: "8471", label: "Computers & parts", aliases: ["laptop", "pc", "desktop", "notebook computer", "macbook", "ssd", "motherboard"] },
-  { code: "8528", label: "Monitors, projectors, TVs", aliases: ["monitor", "projector", "television", "tv screen"] },
-  { code: "8518", label: "Speakers & headphones", aliases: ["headphones", "earbuds", "speaker", "soundbar"] },
-  { code: "8525", label: "Cameras / camcorders", aliases: ["camera", "digital camera", "action cam", "gopro"] },
-
-  // Toys / sports / leisure
-  { code: "9503", label: "Toys", aliases: ["toy", "toys", "lego", "doll", "rc car"] },
-  { code: "9506", label: "Sports gear", aliases: ["ball", "yoga mat", "dumbbell", "skateboard", "tennis racket"] },
-  { code: "9207", label: "Musical instruments", aliases: ["guitar", "piano keyboard", "violin", "drum"] },
-
-  // Home / kitchen
-  { code: "7323", label: "Table/kitchenware (steel)", aliases: ["cookware", "pots", "pans", "steel kettle"] },
-  { code: "3924", label: "Table/kitchenware (plastic)", aliases: ["plastic bowl", "tupperware", "measuring cup"] },
-  { code: "6912", label: "Ceramic tableware", aliases: ["ceramic mug", "plate", "ceramic bowl"] },
-  { code: "9403", label: "Furniture", aliases: ["table", "chair", "desk", "shelf", "cabinet"] },
-  { code: "9405", label: "Lamps / lighting", aliases: ["lamp", "light", "chandelier", "led lamp"] },
-
-  // Beauty / personal care
-  { code: "3304", label: "Beauty / make-up", aliases: ["makeup", "lipstick", "eyeshadow", "cosmetics"] },
-  { code: "3305", label: "Hair preparations", aliases: ["shampoo", "conditioner", "hair gel", "hair dye"] },
-  { code: "3307", label: "Other toiletries", aliases: ["deodorant", "perfume", "aftershave", "toiletries"] },
-
-  // Bags / packaging / misc
-  { code: "3923", label: "Plastic packaging", aliases: ["plastic bag", "zip bag", "poly mailer", "plastic bottle"] },
-  { code: "4819", label: "Paper/board packaging", aliases: ["cardboard box", "paper bag", "mailer box"] },
-
-  // Optical — proven working 10-digit for sunglasses
-  { code: "9004100000", label: "Sunglasses", aliases: ["sunglasses", "sunglass", "shades"] },
-];
-
-/* ----------------------- HS resolution + enrichment --------------------- */
-
-/**
- * Resolve HS from free text:
- * 1) If user typed digits (>=4), return that.
- * 2) Fuzzy match against curated list.
- * 3) HMRC `/search` fallback.
- */
-async function resolveHsFromText(
-  input: string
-): Promise<{ code?: string; source: "numeric" | "dict" | "hmrc" | "none"; match?: string }> {
-  const cleaned = norm(input);
-  const digits = input.replace(/[^\d]/g, "");
-
-  // 1) numeric
-  if (digits.length >= 4) {
-    return { code: digits.length >= 10 ? digits.slice(0, 10) : digits.slice(0, 6), source: "numeric" };
-  }
-
-  // 2) dictionary + fuzzy
-  let best: { code: string; score: number; alias: string } | null = null;
-  for (const item of HS_DICT) {
-    for (const alias of item.aliases) {
-      const score = sim(cleaned, norm(alias));
-      if (!best || score > best.score) best = { code: item.code, score, alias };
-    }
-  }
-  if (best && best.score >= 0.75) {
-    return { code: best.code, source: "dict", match: best.alias };
-  }
-
-  // 3) HMRC search
-  try {
-    const url = `${TT_BASE}/search?q=${encodeURIComponent(input)}`;
-    const res = await fetch(url, { headers: TT_HEADERS, cache: "no-store" });
-    if (res.ok) {
-      const json: any = await res.json();
-      const flat: Array<{ type: string; id: string }> = [];
-      const sections = json?.data ?? [];
-      for (const section of sections) {
-        const items = section?.attributes?.results ?? [];
-        for (const it of items) {
-          if (it?.type && it?.id) flat.push({ type: String(it.type), id: String(it.id) });
-        }
-      }
-      const pick =
-        flat.find((r) => r.type === "commodity" && /^\d{10}$/.test(r.id)) ??
-        flat.find((r) => r.type === "subheading" && /^\d{10}$/.test(r.id)) ??
-        flat.find((r) => r.type === "heading" && /^\d{4}$/.test(r.id));
-      if (pick) return { code: pick.id, source: "hmrc" };
-    }
-  } catch {
-    // ignore
-  }
-
-  return { source: "none" };
-}
-
-/**
- * Fetch description for a numeric code via progressive endpoints:
- *  - /commodities/{10}
- *  - /subheadings/{10}-80
- *  - /headings/{4}
- */
-async function fetchHsDescriptionIfAny(codeOrProduct: string) {
-  const digits = codeOrProduct.replace(/[^\d]/g, "");
-  if (!digits) return { hsCode: undefined as string | undefined, description: undefined as string | undefined };
-
-  const attempts: Array<{ code: string; url: string; label: "commodity" | "subheading" | "heading" }> = [];
-  if (digits.length >= 10) {
-    const c10 = digits.slice(0, 10);
-    attempts.push({ code: c10, url: `${TT_BASE}/commodities/${c10}`, label: "commodity" });
-    attempts.push({ code: c10, url: `${TT_BASE}/subheadings/${c10}-80`, label: "subheading" });
-  }
-  if (digits.length >= 4) {
-    const h4 = digits.slice(0, 4);
-    attempts.push({ code: h4, url: `${TT_BASE}/headings/${h4}`, label: "heading" });
-  }
-
-  for (const attempt of attempts) {
-    try {
-      const res = await fetch(attempt.url, { headers: TT_HEADERS, cache: "no-store" });
-      if (!res.ok) continue;
-      const json: any = await res.json();
-      const data = Array.isArray(json?.data) ? json.data[0] : json?.data;
-      const attrs = data?.attributes ?? {};
-      const desc: string | undefined =
-        attrs.formatted_description ?? attrs.description_plain ?? attrs.description ?? undefined;
-      if (desc) return { hsCode: attempt.code, description: desc };
-    } catch {
-      // try next
-    }
-  }
-
-  const fallback =
-    (digits.length >= 10 && digits.slice(0, 10)) ||
-    (digits.length >= 6 && digits.slice(0, 6)) ||
-    (digits.length >= 4 && digits.slice(0, 4)) ||
-    undefined;
-
-  return { hsCode: fallback, description: undefined };
-}
-
-/* ------------------------------- Rates --------------------------------- */
-
-// DEMO US rates (swap for real USITC/CBP lookup soon)
-const DEMO_US_RATES: Record<string, number> = {
-  "9004100000": 0.025, // Sunglasses: example US MFN rate ~2.5%
-  "6404000000": 0.10,  // Footwear plastics/rubber (example only)
-  "8517120000": 0.00,  // Mobile phones often duty-free (example)
-};
-
-/* --------------------------- Response builder -------------------------- */
-
-function buildResponse(opts: {
+type BuildResponseArgs = {
   product: string;
   country: string;
   price: number;
   rate: number;
   hsCode?: string;
   description?: string;
-  resolvedFrom?: "numeric" | "dict" | "hmrc" | "none";
-  destination: "usa" | "uk" | "eu";
-}) {
-  const { product, country, price, rate, hsCode, description, resolvedFrom, destination } = opts;
-  const duty = +(Math.max(0, price * rate)).toFixed(2);
+  resolvedFrom: ResolvedSource;
+  destination: Destination;
+  granularity?: "10" | "6" | "none";
+};
 
-  const tag =
-    resolvedFrom && resolvedFrom !== "numeric"
-      ? ` (via ${resolvedFrom === "dict" ? "dictionary" : resolvedFrom.toUpperCase()})`
-      : "";
+/* =========================
+   Curated HS alias dictionary (mostly 6-digit for portability)
+========================= */
+
+// Replace your HS_DICT with this
+const HS_DICT: Array<{ code: string; label: string; aliases: string[] }> = [
+  /* =========================
+     APPAREL
+  ========================= */
+  { code: "6109", label: "T-shirts (knitted)", aliases: [
+    "tshirt","t shirt","t-shirt","tee","graphic tee","crew neck tee","v neck tee",
+    "mens tshirt","womens tshirt","kids tshirt","printed tee"
+  ]},
+  { code: "6110", label: "Sweaters / pullovers / hoodies (knit)", aliases: [
+    "sweater","pullover","jumper","hoodie","zip hoodie","cardigan","fleece","crew sweater","knit sweater"
+  ]},
+  { code: "6103", label: "Men’s coats/jackets (knit)", aliases: [
+    "mens jacket","mens coat","knit jacket","track jacket","zip jacket"
+  ]},
+  { code: "6104", label: "Women’s coats/jackets (knit)", aliases: [
+    "womens jacket","ladies jacket","ladies coat","knit jacket women"
+  ]},
+  { code: "6102", label: "Women’s suits/ensembles (knit)", aliases: [
+    "womens suit","ladies suit","knit suit women","co-ord knit"
+  ]},
+  { code: "6105", label: "Men’s shirts (knit)", aliases: [
+    "mens polo","mens knit shirt","polo shirt","polo"
+  ]},
+  { code: "6203", label: "Men’s suits/trousers (woven)", aliases: [
+    "mens trousers","mens pants","mens chinos","mens suit","mens blazer","men suit set"
+  ]},
+  { code: "6204", label: "Women’s suits/trousers (woven)", aliases: [
+    "womens trousers","ladies pants","ladies chinos","womens suit","women blazer"
+  ]},
+  { code: "6112", label: "Tracksuits & activewear (knit)", aliases: [
+    "tracksuit","track pants","joggers","yoga pants","gym leggings","running tights","sweatpants"
+  ]},
+  { code: "6505", label: "Hats & caps (knit or textile)", aliases: [
+    "cap","baseball cap","beanie","knit hat","bucket hat","snapback"
+  ]},
+
+  /* =========================
+     FOOTWEAR
+  ========================= */
+  { code: "6404", label: "Footwear with textile uppers", aliases: [
+    "shoes","sneakers","trainers","canvas shoes","running shoes","gym shoes","runners","athletic shoes"
+  ]},
+  { code: "6403", label: "Footwear with leather uppers", aliases: [
+    "leather shoes","oxfords","loafers","derby shoes","dress shoes","leather boots"
+  ]},
+  { code: "6402", label: "Footwear with rubber/plastic uppers", aliases: [
+    "rubber shoes","plastic shoes","clogs","slides","flip flops","sandals","water shoes","beach sandals"
+  ]},
+  { code: "6401", label: "Waterproof footwear (rubber/plastic)", aliases: [
+    "rain boots","wellies","galoshes","waterproof boots"
+  ]},
+  { code: "6405", label: "Other footwear", aliases: [
+    "house slippers","ballet flats","espadrilles","other shoes"
+  ]},
+
+  /* =========================
+     ELECTRONICS
+  ========================= */
+  { code: "847130", label: "Portable computers (laptops/tablets)", aliases: [
+    "laptop","notebook","macbook","chromebook","tablet pc","ultrabook"
+  ]},
+  { code: "847150", label: "Computer processing units", aliases: [
+    "desktop pc","computer tower","mini pc","pc barebone","cpu unit"
+  ]},
+  { code: "851762", label: "Networking equipment (routers/switches)", aliases: [
+    "wifi router","router","mesh router","network switch","ethernet switch","access point"
+  ]},
+  { code: "851810", label: "Microphones", aliases: [
+    "microphone","usb mic","podcast mic","condenser mic","dynamic mic","lapel mic"
+  ]},
+  { code: "851830", label: "Headphones/earphones", aliases: [
+    "headphones","earbuds","earphones","headset","wireless earbuds","gaming headset"
+  ]},
+  { code: "852852", label: "Monitors (LCD/LED)", aliases: [
+    "monitor","pc monitor","gaming monitor","lcd monitor","led monitor","display"
+  ]},
+  { code: "850760", label: "Lithium-ion batteries", aliases: [
+    "lithium battery","li-ion battery","phone battery","power bank","rechargeable battery"
+  ]},
+
+  /* =========================
+     BAGS & ACCESSORIES
+  ========================= */
+  { code: "4202", label: "Bags, luggage, cases", aliases: [
+    "backpack","handbag","purse","sling bag","tote bag","duffel bag","suitcase","carry on","briefcase",
+    "wallet","card holder","camera bag","cosmetic bag","makeup bag","pouch"
+  ]},
+  { code: "4203", label: "Leather apparel & accessories", aliases: [
+    "leather belt","leather gloves","leather jacket","belt","gloves (leather)"
+  ]},
+  { code: "6117", label: "Other made-up clothing accessories (knit)", aliases: [
+    "scarves","knit scarf","knit gloves","arm warmers","leg warmers","knit accessories"
+  ]},
+
+  /* =========================
+     KITCHENWARE & HOME
+  ========================= */
+  { code: "3924", label: "Table/kitchenware (plastic)", aliases: [
+    "plastic bowl","food container","tupperware","measuring cup","plastic plate","storage container"
+  ]},
+  { code: "7013", label: "Glassware (table/kitchen)", aliases: [
+    "wine glass","drinking glass","glass cup","glass tumbler","glass jar","vase (table)"
+  ]},
+  { code: "7323", label: "Table/kitchenware (steel)", aliases: [
+    "stainless bowl","steel pot","steel pan","cutlery","utensils","kitchen utensils","steel strainer"
+  ]},
+  { code: "7615", label: "Table/kitchenware (aluminium)", aliases: [
+    "aluminium pot","aluminum pan","aluminium tray","aluminum tray","aluminium kettle"
+  ]},
+  { code: "6912", label: "Ceramic table/kitchenware", aliases: [
+    "ceramic mug","ceramic plate","porcelain bowl","stoneware cup","ceramic dinnerware"
+  ]},
+
+  /* =========================
+     SPORTING GOODS
+  ========================= */
+  { code: "9506", label: "Sports equipment (general)", aliases: [
+    "fitness equipment","dumbbells","kettlebell","yoga mat","exercise band","basketball","football",
+    "tennis racket","skates","helmets (sport)","sports gear"
+  ]},
+  { code: "9507", label: "Fishing rods/tackle", aliases: [
+    "fishing rod","fishing reel","fishing tackle","lure","rod and reel"
+  ]},
+
+  /* =========================
+     OPTIONAL CATEGORIES (Tools / Toys / Jewellery)
+     — include if you want broader coverage now
+  ========================= */
+  { code: "8205", label: "Hand tools (spanners, pliers, etc.)", aliases: [
+    "hand tools","wrench","spanner","pliers","hammer","screwdriver set","multi tool"
+  ]},
+  { code: "9503", label: "Toys", aliases: [
+    "toy","plush toy","doll","action figure","lego","building blocks","kids toy","rc car"
+  ]},
+  { code: "7117", label: "Imitation jewellery", aliases: [
+    "fashion jewelry","costume jewelry","bracelet","necklace","earrings","anklet"
+  ]},
+  { code: "7113", label: "Articles of jewellery (precious metal)", aliases: [
+    "gold ring","silver necklace","gold bracelet","fine jewelry","wedding ring"
+  ]},
+
+  /* =========================
+     OPTICAL (demo 10-digit intact)
+  ========================= */
+  { code: "9004100000", label: "Sunglasses", aliases: [
+    "sunglasses","sunglass","shades"
+  ]},
+  { code: "900410", label: "Sunglasses (general)", aliases: [
+    "sunglasses 6 digit","sunglasses hs"
+  ]},
+];
+
+/* =========================
+   Demo US duty rates by 6-digit
+   (Real product-level rates are 8–10 digits; this is only to make the app feel tangible.)
+========================= */
+
+const DEMO_US_RATES_BY6: Record<string, number> = {
+  "6404": 0.12, // shoes (textile uppers) - demo
+  "6403": 0.08, // leather shoes - demo
+  "4202": 0.17, // bags / luggage - demo
+  "8518": 0.00, // headphones - demo
+  "3924": 0.03, // plastic kitchenware - demo
+  "7013": 0.05, // glassware - demo
+  "6109": 0.16, // t-shirts (knit) - demo
+  "6110": 0.14, // sweaters / pullovers - demo
+  "900410": 0.02, // sunglasses (general) - demo
+};
+
+/* =========================
+   Internal descriptions (avoid flaky external calls)
+========================= */
+const INTERNAL_HS_DESCRIPTIONS: Record<string, string> = {
+  "6404": "Footwear with outer soles of rubber or plastics and uppers of textile materials",
+  "6403": "Footwear with outer soles of rubber, plastics, leather or composition leather and uppers of leather",
+  "4202": "Trunks, suitcases, handbags and similar containers",
+  "8518": "Microphones, loudspeakers; headphones and earphones",
+  "3924": "Tableware, kitchenware and other household articles, of plastics",
+  "7013": "Glassware of a kind used for table, kitchen, toilet, office, indoor decoration",
+  "6109": "T-shirts, singlets and other vests, knitted or crocheted",
+  "6110": "Jerseys, pullovers, cardigans, waistcoats and similar articles, knitted",
+  "900410": "Sunglasses",
+  "9004100000": "Sunglasses",
+};
+
+/* =========================
+   Helpers
+========================= */
+
+function isNumericHs(s: string): false | "6" | "10" {
+  const raw = s.replace(/\D/g, "");
+  if (raw.length >= 10) return "10";
+  if (raw.length === 6) return "6";
+  return false;
+}
+
+function normalize(s: string) {
+  return s.trim().toLowerCase();
+}
+
+function lookupAlias(input: string): { code: string; label: string } | null {
+  const q = normalize(input);
+  for (const row of HS_DICT) {
+    if (row.aliases.some(a => normalize(a) === q)) return { code: row.code, label: row.label };
+  }
+  // lenient contains match
+  for (const row of HS_DICT) {
+    if (row.aliases.some(a => q.includes(normalize(a)))) return { code: row.code, label: row.label };
+  }
+  return null;
+}
+
+function resolveHsFromInput(productRaw: string): {
+  code?: string;
+  source: ResolvedSource;
+  granularity: "10" | "6" | "none";
+  friendly?: string;
+} {
+  const product = productRaw.trim();
+  const numeric = isNumericHs(product);
+  if (numeric === "10") {
+    return { code: product.replace(/\D/g, "").slice(0, 10), source: "numeric", granularity: "10" };
+  }
+  if (numeric === "6") {
+    return { code: product.replace(/\D/g, "").slice(0, 6), source: "numeric", granularity: "6" };
+  }
+
+  const alias = lookupAlias(product);
+  if (alias) {
+    return {
+      code: alias.code,
+      source: "dict",
+      granularity: alias.code.length >= 10 ? "10" : "6",
+      friendly: alias.label,
+    };
+  }
+  return { source: "none", granularity: "none" };
+}
+
+function pickUsRate(hsCode?: string): number | undefined {
+  if (!hsCode) return undefined;
+  const code = hsCode.replace(/\D/g, "");
+
+  // exact 10-digit demo override
+  if (code === "9004100000") return 0.02;
+
+  // 6-digit fallback
+  const c6 = code.slice(0, 6);
+  if (DEMO_US_RATES_BY6[c6] !== undefined) return DEMO_US_RATES_BY6[c6];
+
+  return undefined;
+}
+
+function hsDescriptionFromInternal(hsCode?: string): string | undefined {
+  if (!hsCode) return undefined;
+  const c = hsCode.replace(/\D/g, "");
+  return INTERNAL_HS_DESCRIPTIONS[c] ?? INTERNAL_HS_DESCRIPTIONS[c.slice(0, 6)];
+}
+
+function buildResponse(args: BuildResponseArgs) {
+  const duty = +(args.price * args.rate).toFixed(2);
+
+  const resolution: Resolution =
+    args.resolvedFrom === "numeric"
+      ? "numeric"
+      : args.resolvedFrom === "dict"
+      ? args.granularity === "6"
+        ? "general-6"
+        : "dictionary"
+      : "none";
 
   return {
     duty,
-    rate,
-    resolution: resolvedFrom ?? "none",
-    breakdown: { product, country, price, hsCode, description },
-    notes: hsCode
-      ? `HS ${hsCode}${description ? ` — ${description}` : ""}${tag}. Destination: ${destination.toUpperCase()}.`
-      : `Destination: ${destination.toUpperCase()}. Placeholder ${(rate * 100).toFixed(1)}% rate.`,
+    rate: args.rate,
+    resolution,
+    breakdown: {
+      product: args.product,
+      country: args.country,
+      price: args.price,
+      hsCode: args.hsCode,
+      description: args.description,
+    },
+    notes: `Destination: ${args.destination.toUpperCase()}. Placeholder ${(args.rate * 100).toFixed(
+      1
+    )}% rate.`,
   };
 }
 
-/* ------------------------------- Handlers ------------------------------ */
+/* =========================
+   POST /api/estimate
+========================= */
 
 export async function POST(req: Request) {
-  const body = (await req.json()) as Payload;
+  try {
+    const body = (await req.json()) as {
+      product?: string;
+      price?: number;
+      country?: string;
+      to?: Destination;
+    };
 
-  const product = (body.product ?? "").trim();
-  const country = (body.country ?? "").trim();
-  const price = Number(body.price);
-  const destinationRaw = (body.destination ?? "usa").toString().toLowerCase();
-  const destination = (["usa", "uk", "eu"].includes(destinationRaw) ? destinationRaw : "usa") as
-    | "usa"
-    | "uk"
-    | "eu";
+    const product = (body.product ?? "").trim();
+    const country = (body.country ?? "").trim();
+    const price = Number(body.price);
+    const destination: Destination = (body.to ?? "usa").toLowerCase() as Destination;
 
-  if (!product || !country || !Number.isFinite(price) || price < 0) {
+    if (!product || !country || !Number.isFinite(price) || price < 0) {
+      return NextResponse.json(
+        { error: "Invalid input. Provide product, country, and non-negative price." },
+        { status: 400 }
+      );
+    }
+
+    const resolved = resolveHsFromInput(product);
+    let hsCode = resolved.code;
+    let description = hsDescriptionFromInternal(hsCode) || resolved.friendly;
+
+    // Destination-specific rate selection (demo)
+    let rate = 0.05;
+    if (destination === "usa") {
+      const maybe = pickUsRate(hsCode);
+      if (maybe !== undefined) rate = maybe;
+    } else if (destination === "uk") {
+      rate = 0.05;
+    } else if (destination === "eu") {
+      rate = 0.05;
+    }
+
+    // growth: log misses so we can add aliases later
+    if (resolved.source === "none") {
+      console.warn("[HS_MISS]", { product, country, destination });
+    }
+
     return NextResponse.json(
-      { error: "Invalid input. Provide product, country, and non-negative price." },
-      { status: 400 }
+      buildResponse({
+        product,
+        country,
+        price,
+        rate,
+        hsCode,
+        description,
+        resolvedFrom: resolved.source,
+        destination,
+        granularity: resolved.granularity,
+      })
     );
+  } catch (err) {
+    console.error(err);
+    return NextResponse.json({ error: "Bad request" }, { status: 400 });
   }
-
-  // Resolve HS from free text or numeric
-  const resolved = await resolveHsFromText(product);
-  const codeToDescribe = resolved.code ?? product;
-  const { hsCode, description } = await fetchHsDescriptionIfAny(codeToDescribe);
-
-  // Pick a rate based on destination (demo logic; replace with real sources)
-  let rate = 0.05; // fallback
-  if (destination === "usa") {
-    if (hsCode && DEMO_US_RATES[hsCode] !== undefined) rate = DEMO_US_RATES[hsCode];
-  } else if (destination === "uk") {
-    // Could add a UK rate lookup here (TTS measures). Using fallback for now.
-    rate = 0.05;
-  } else if (destination === "eu") {
-    // Could add TARIC lookup here. Using fallback for now.
-    rate = 0.05;
-  }
-
-  return NextResponse.json(
-    buildResponse({ product, country, price, rate, hsCode, description, resolvedFrom: resolved.source, destination })
-  );
 }
+
+/* =========================
+   GET /api/estimate?product=...&price=...&country=...&to=usa
+   (handy for quick tests)
+========================= */
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const product = (searchParams.get("product") ?? "").trim();
   const country = (searchParams.get("country") ?? "").trim();
   const price = Number(searchParams.get("price"));
-  const destinationRaw = (searchParams.get("to") ?? "usa").toLowerCase();
-  const destination = (["usa", "uk", "eu"].includes(destinationRaw) ? destinationRaw : "usa") as
-    | "usa"
-    | "uk"
-    | "eu";
+  const destination = (searchParams.get("to") ?? "usa").toLowerCase() as Destination;
 
   if (!product || !country || !Number.isFinite(price) || price < 0) {
     return NextResponse.json(
@@ -289,20 +402,35 @@ export async function GET(req: Request) {
     );
   }
 
-  const resolved = await resolveHsFromText(product);
-  const codeToDescribe = resolved.code ?? product;
-  const { hsCode, description } = await fetchHsDescriptionIfAny(codeToDescribe);
+  const resolved = resolveHsFromInput(product);
+  let hsCode = resolved.code;
+  let description = hsDescriptionFromInternal(hsCode) || resolved.friendly;
 
   let rate = 0.05;
   if (destination === "usa") {
-    if (hsCode && DEMO_US_RATES[hsCode] !== undefined) rate = DEMO_US_RATES[hsCode];
+    const maybe = pickUsRate(hsCode);
+    if (maybe !== undefined) rate = maybe;
   } else if (destination === "uk") {
     rate = 0.05;
   } else if (destination === "eu") {
     rate = 0.05;
   }
 
+  if (resolved.source === "none") {
+    console.warn("[HS_MISS]", { product, country, destination });
+  }
+
   return NextResponse.json(
-    buildResponse({ product, country, price, rate, hsCode, description, resolvedFrom: resolved.source, destination })
+    buildResponse({
+      product,
+      country,
+      price,
+      rate,
+      hsCode,
+      description,
+      resolvedFrom: resolved.source,
+      destination,
+      granularity: resolved.granularity,
+    })
   );
 }
