@@ -78,8 +78,9 @@ function formatHs(hs: string | null | undefined): string | null {
  *  - "Free" → { pct: 0 }
  *  - Percentages: "5%", "2.5% ad val." (tolerant of footnotes like 2%*)
  *  - Dollar-per-unit: $/kg, $/g (→ $/kg), $/lb (→ $/kg), $/pair, $/pr, $/prs
- *  - Per dozen pairs: $/doz. pr., $/dozen pr(s) (→ $/pair ÷ 12)
- *  - Per dozen (generic): $/doz., $/dozen
+ *  - Per dozen pairs: $/doz. pr., $/dozen pr(s), $/dz pr. (→ $/pair ÷ 12)
+ *  - Per dozen (generic): $/doz., $/dozen, $/dz
+ *  - Per gross: $/gross (→ $/unit ÷ 144)
  *  - Cents per unit: "7.5¢/kg", "2 c/kg", "2 c per doz. pr." (→ dollars)
  *  - “per” wording: "$1 per kg", "2 c per doz. pr."
  */
@@ -107,7 +108,7 @@ function parseGeneralRateRich(
   for (const m of t.matchAll(/\$?\s*(\d+(?:\.\d+)?)\s*\/\s*([A-Za-z.\s0-9]+)\b/gi)) {
     let val = parseFloat(m[1]);
     let unit = (m[2] || '').toLowerCase().replace(/\s+/g, ' ').trim();
-    const unitNorm = unit.replace(/\./g, '').replace(/\s+/g, ' ').trim(); // "doz pr", "prs", etc.
+    const unitNorm = unit.replace(/\./g, '').replace(/\s+/g, ' ').trim(); // "doz pr", "prs", "dz pr", "gross", etc.
 
     // weights → per kg
     if (/\bkg(s)?\b/.test(unitNorm)) {
@@ -129,15 +130,21 @@ function parseGeneralRateRich(
       continue;
     }
 
-    // dozen pairs → convert to per pair by /12
-    if (/\b(doz|dozen)\b/.test(unitNorm) && /\b(pr|prs|pair|pairs)\b/.test(unitNorm)) {
+    // dozen pairs → convert to per pair by /12  (doz/dozen/dz + pr/prs/pair/pairs)
+    if (/\b(doz|dozen|dz)\b/.test(unitNorm) && /\b(pr|prs|pair|pairs)\b/.test(unitNorm)) {
       components.push({ kind: 'amount', value: val / 12, per: 'pair' });
       continue;
     }
 
     // dozen (generic)
-    if (/\b(doz|dozen)\b/.test(unitNorm)) {
+    if (/\b(doz|dozen|dz)\b/.test(unitNorm)) {
       components.push({ kind: 'amount', value: val, per: 'dozen' });
+      continue;
+    }
+
+    // gross (144 units) → per unit ÷ 144
+    if (/\bgross\b/.test(unitNorm)) {
+      components.push({ kind: 'amount', value: val / 144, per: 'unit' });
       continue;
     }
 
@@ -164,12 +171,17 @@ function parseGeneralRateRich(
       components.push({ kind: 'amount', value: val, per: 'pair' });
       continue;
     }
-    if (/\b(doz|dozen)\b/.test(unit) && /\b(pr|prs|pair|pairs)\b/.test(unit)) {
+    // dozen pairs → convert to per pair by /12
+    if (/\b(doz|dozen|dz)\b/.test(unit) && /\b(pr|prs|pair|pairs)\b/.test(unit)) {
       components.push({ kind: 'amount', value: val / 12, per: 'pair' });
       continue;
     }
-    if (/\b(doz|dozen)\b/.test(unit)) {
+    if (/\b(doz|dozen|dz)\b/.test(unit)) {
       components.push({ kind: 'amount', value: val, per: 'dozen' });
+      continue;
+    }
+    if (/\bgross\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val / 144, per: 'unit' });
       continue;
     }
     if (/\b(no|unit|each|u)\b/.test(unit)) {
@@ -192,12 +204,16 @@ function parseGeneralRateRich(
       components.push({ kind: 'amount', value: val, per: 'pair' });
       continue;
     }
-    if (/\b(doz|dozen)\b/.test(unit) && /\b(pr|prs|pair|pairs)\b/.test(unit)) {
+    if (/\b(doz|dozen|dz)\b/.test(unit) && /\b(pr|prs|pair|pairs)\b/.test(unit)) {
       components.push({ kind: 'amount', value: val / 12, per: 'pair' });
       continue;
     }
-    if (/\b(doz|dozen)\b/.test(unit)) {
+    if (/\b(doz|dozen|dz)\b/.test(unit)) {
       components.push({ kind: 'amount', value: val, per: 'dozen' });
+      continue;
+    }
+    if (/\bgross\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val / 144, per: 'unit' });
       continue;
     }
     if (/\b(no|unit|each|u)\b/.test(unit)) {
@@ -220,12 +236,16 @@ function parseGeneralRateRich(
       components.push({ kind: 'amount', value: val, per: 'pair' });
       continue;
     }
-    if (/\b(doz|dozen)\b/.test(unit) && /\b(pr|prs|pair|pairs)\b/.test(unit)) {
+    if (/\b(doz|dozen|dz)\b/.test(unit) && /\b(pr|prs|pair|pairs)\b/.test(unit)) {
       components.push({ kind: 'amount', value: val / 12, per: 'pair' });
       continue;
     }
-    if (/\b(doz|dozen)\b/.test(unit)) {
+    if (/\b(doz|dozen|dz)\b/.test(unit)) {
       components.push({ kind: 'amount', value: val, per: 'dozen' });
+      continue;
+    }
+    if (/\bgross\b/.test(unit)) {
+      components.push({ kind: 'amount', value: val / 144, per: 'unit' });
       continue;
     }
     if (/\b(no|unit|each|u)\b/.test(unit)) {
