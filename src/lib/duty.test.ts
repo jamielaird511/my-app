@@ -9,7 +9,7 @@ describe('computeDutyUSD', () => {
       weightKg: null,
       notes: [],
     });
-    expect(duty).toBeCloseTo(10, 2); // 50 * 10 * 0.02
+    expect(duty).toBeCloseTo(999, 2); // 50 * 10 * 0.02
   });
 
   it('handles $/kg specific duty', () => {
