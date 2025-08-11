@@ -2,6 +2,8 @@
 
 import React, { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
+import CountrySelect from '@/components/CountrySelect';
+import { findCountryByCode } from '@/lib/countries';
 
 /* --------------------------------
    Page wrapper (Suspense required)
@@ -44,7 +46,7 @@ type DetailedApiResult = {
     hsCodeFormatted?: string | null;
     description?: string | null;
     qty?: number | null;
-    weightKg?: number | null;
+    weightKg?: string | number | null;
   };
   alternates?: Array<{
     hsCode: string;
@@ -87,7 +89,7 @@ type ViewModel = {
     hsCodeFormatted?: string | null;
     description?: string | null;
     qty?: number | null;
-    weightKg?: number | null;
+    weightKg?: string | number | null;
   };
   notes?: string[];
   alternates?: ViewAlt[];
@@ -102,28 +104,27 @@ const currency = new Intl.NumberFormat('en-US', {
   maximumFractionDigits: 2,
 });
 
-function titleCase(s: string) {
-  return s
+const titleCase = (s: string) =>
+  s
     .trim()
     .replace(/\s+/g, ' ')
     .split(' ')
     .map((w) => (w ? w[0]!.toUpperCase() + w.slice(1).toLowerCase() : ''))
     .join(' ');
-}
 
-function rateToText(rate: number | null | undefined) {
+const rateToText = (rate: number | null | undefined) => {
   if (rate === 0) return 'Free';
   if (rate == null) return '—';
   const pct = rate * 100;
   return `${pct.toFixed(pct < 1 ? 2 : 1)}%`;
-}
+};
 
-function componentsText(components?: RateComponent[]) {
-  if (!components?.length) return '—';
-  return components
-    .map((c) => (c.kind === 'pct' ? `${(c.value * 100).toFixed(2)}%` : `$${c.value}/${c.per}`))
-    .join(' + ');
-}
+const componentsText = (components?: RateComponent[]) =>
+  !components?.length
+    ? '—'
+    : components
+        .map((c) => (c.kind === 'pct' ? `${(c.value * 100).toFixed(2)}%` : `$${c.value}/${c.per}`))
+        .join(' + ');
 
 /* -----------------------------------
    Toast + ResolutionBadge components
@@ -141,7 +142,6 @@ function Toast({
     const id = setTimeout(onClose, 2500);
     return () => clearTimeout(id);
   }, [onClose]);
-
   const base = 'fixed top-4 right-4 z-50 rounded-md px-4 py-2 shadow text-sm';
   const style = kind === 'success' ? 'bg-green-600 text-white' : 'bg-red-600 text-white';
   return <div className={`${base} ${style}`}>{message}</div>;
@@ -163,7 +163,38 @@ function ResolutionBadge({ r }: { r: Resolution }) {
 }
 
 /* -----------------------
-   Normalization helpers
+   HS sanitizing & formatting
+------------------------*/
+// Display: 6->4.2, 8->4.2.2, 10->4.2.4
+function formatHsCode(code: string): string {
+  const digits = code.replace(/\D/g, '');
+  if (digits.length === 6) return digits.replace(/(\d{4})(\d{2})/, '$1.$2');
+  if (digits.length === 8) return digits.replace(/(\d{4})(\d{2})(\d{2})/, '$1.$2.$3');
+  if (digits.length === 10) return digits.replace(/(\d{4})(\d{2})(\d{4})/, '$1.$2.$3');
+  return code;
+}
+
+// Accept messy paste: strip non-digits; if >10 digits, prefer first6+last4; else truncate to 10.
+function sanitizeHS(raw: string) {
+  const groups = raw.match(/\d+/g) || [];
+  const digits = groups.join('');
+  if (digits.length <= 10) return digits;
+
+  const first6 = digits.slice(0, 6);
+  const last4 = digits.slice(-4);
+  const candidate = `${first6}${last4}`;
+  if (candidate.length === 10) return candidate;
+
+  return digits.slice(0, 10);
+}
+
+function isValidHS(raw: string) {
+  const d = sanitizeHS(raw);
+  return d.length === 6 || d.length === 8 || d.length === 10;
+}
+
+/* -----------------------
+   Type guards & normalize
 ------------------------*/
 function isDetailed(x: unknown): x is DetailedApiResult {
   return !!x && typeof x === 'object' && 'breakdown' in (x as any) && 'resolution' in (x as any);
@@ -238,22 +269,86 @@ function normalizeResult(
 }
 
 /* -----------------------
+   API helpers (with 8->10 fallback)
+------------------------*/
+async function callEstimate(payload: Record<string, unknown>) {
+  const res = await fetch('/api/estimate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await res.text();
+  let data: unknown = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(text || `Request failed: ${res.status}`);
+  }
+  if (!res.ok) throw new Error((data as any)?.error || text || 'Request failed');
+  return data as DetailedApiResult | SimpleApiResult;
+}
+
+// Try the given code; if it's 8 digits and the response is a "no match", try padding '00' to 10.
+async function estimateWithEightToTenFallback(code: string, basePayload: Record<string, unknown>) {
+  const run = (hs: string) => callEstimate({ ...basePayload, query: hs, input: hs, product: hs });
+
+  let raw = await run(code);
+
+  // Only fallback if this is a detailed object AND explicitly says no match
+  if (code.length === 8 && isDetailed(raw) && raw.resolution === 'none') {
+    const padded = `${code}00`;
+    try {
+      const raw2 = await run(padded);
+      // Use the padded result only if it found something (or if the second shape isn't "detailed none")
+      if (!isDetailed(raw2) || raw2.resolution !== 'none') {
+        return { raw: raw2, code: padded };
+      }
+    } catch {
+      // ignore and keep the original raw
+    }
+  }
+
+  return { raw, code };
+}
+
+/* -----------------------
    Main client component
 ------------------------*/
 function EstimateClient() {
   const search = useSearchParams();
   const router = useRouter();
 
-  // seed from query params + localStorage
-  const [product, setProduct] = useState(search.get('product') ?? '');
+  // from landing/manual
+  const preHs = search.get('hs') ?? '';
+  const preDesc = search.get('desc') ?? '';
+  const preSource = search.get('source') ?? '';
+
+  const focusedFromPrefill = useRef(false);
+
+  // HS input (raw as typed)
+  const [hsInput, setHsInput] = useState<string>(preHs || '');
+  const [prefilledDesc, setPrefilledDesc] = useState<string>(preDesc);
+
+  const priceInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Price, country, qty, weight
   const [price, setPrice] = useState<string>(
     search.get('price') ??
       (typeof window !== 'undefined' ? (localStorage.getItem('est_price') ?? '') : ''),
   );
-  const [country, setCountry] = useState(
-    search.get('country') ??
-      (typeof window !== 'undefined' ? (localStorage.getItem('est_country') ?? '') : ''),
+
+  const seededCode = useMemo(() => {
+    const fromQuery = search.get('origin') || search.get('originCountryCode');
+    return (fromQuery || '').toUpperCase();
+  }, [search]);
+  const [countryCode, setCountryCode] = useState<string>(seededCode || '');
+
+  const countryName = useMemo(
+    () => (countryCode ? (findCountryByCode(countryCode)?.name ?? '') : ''),
+    [countryCode],
   );
+
   const [qty, setQty] = useState<string>(
     search.get('qty') ??
       (typeof window !== 'undefined' ? (localStorage.getItem('est_qty') ?? '') : ''),
@@ -267,65 +362,67 @@ function EstimateClient() {
   const [autoUpdating, setAutoUpdating] = useState(false);
   const [toast, setToast] = useState<{ kind: 'success' | 'error'; msg: string } | null>(null);
   const [view, setView] = useState<ViewModel | null>(null);
-  const [calcTime, setCalcTime] = useState<string>(''); // client-only timestamp
+  const [calcTime, setCalcTime] = useState<string>('');
 
   const priceNum = useMemo(() => Number(price), [price]);
   const qtyNum = useMemo(() => (qty === '' ? null : Number(qty)), [qty]);
   const weightNum = useMemo(() => (weightKg === '' ? null : Number(weightKg)), [weightKg]);
 
-  const hasHsCode = useMemo(() => /^\d{6}(\d{4})?$/.test(product.trim()), [product]);
-  const isMissingHsCode = product.trim().length > 0 && !hasHsCode;
+  const hsDigits = useMemo(() => sanitizeHS(hsInput), [hsInput]);
+  const hsValid = useMemo(() => isValidHS(hsInput), [hsInput]);
+
+  const hasCountry = countryCode.trim().length === 2;
 
   const canSubmit =
-    !!product.trim() &&
-    !!country.trim() &&
+    hsValid &&
+    hasCountry &&
     Number.isFinite(priceNum) &&
     price !== '' &&
     priceNum >= 0 &&
     !loading &&
     !autoUpdating;
 
+  // Focus price ONLY when arriving with prefilled HS from landing/manual
+  useEffect(() => {
+    if (focusedFromPrefill.current) return;
+    const cameFromPrefill = preHs && (preSource === 'landing' || preSource === 'manual');
+    if (cameFromPrefill) {
+      setHsInput(preHs);
+      if (preDesc) setPrefilledDesc(preDesc);
+      setTimeout(() => priceInputRef.current?.focus(), 50);
+      if (preSource) setToast({ kind: 'success', msg: `HS ${formatHsCode(preHs)} prefilled` });
+      focusedFromPrefill.current = true;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preHs, preDesc, preSource]);
+
   // persist locals
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    if (country.trim()) localStorage.setItem('est_country', country.trim());
+    localStorage.setItem('est_country_code', countryCode ?? '');
     if (price !== '') localStorage.setItem('est_price', String(priceNum));
     if (qty !== '') localStorage.setItem('est_qty', String(qtyNum));
     if (weightKg !== '') localStorage.setItem('est_weight', String(weightNum));
-  }, [country, price, priceNum, qty, qtyNum, weightKg, weightNum]);
+  }, [countryCode, price, priceNum, qty, qtyNum, weightKg, weightNum]);
 
-  // shareable URL
+  // shareable URL — only set ?hs= when HS is valid
   useEffect(() => {
     const params = new URLSearchParams();
-    if (product.trim()) params.set('product', product.trim());
-    if (country.trim()) params.set('country', country.trim());
+    if (hsValid) params.set('hs', hsDigits);
+    if (prefilledDesc) params.set('desc', prefilledDesc);
+    if (countryName) params.set('country', countryName);
+    if (countryCode.trim()) params.set('origin', countryCode.trim());
     if (Number.isFinite(priceNum) && price !== '') params.set('price', String(priceNum));
     if (qtyNum != null && Number.isFinite(qtyNum)) params.set('qty', String(qtyNum));
     if (weightNum != null && Number.isFinite(weightNum)) params.set('weightKg', String(weightNum));
     const qs = params.toString();
     router.replace(`/estimate${qs ? `?${qs}` : ''}`, { scroll: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [product, country, priceNum, qtyNum, weightNum]);
+  }, [hsValid, hsDigits, prefilledDesc, countryName, countryCode, priceNum, qtyNum, weightNum]);
 
-  async function callEstimate(payload: Record<string, unknown>) {
-    const res = await fetch('/api/estimate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-
-    const text = await res.text();
-    let data: unknown = {};
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {
-      throw new Error(text || `Request failed: ${res.status}`);
-    }
-
-    if (!res.ok) throw new Error((data as any)?.error || text || 'Request failed');
-    return data as DetailedApiResult | SimpleApiResult;
-  }
-
+  /* -----------------------
+     Submit handler (with fallback)
+  ------------------------*/
   async function handleEstimate(e: React.FormEvent) {
     e.preventDefault();
     if (!canSubmit) return;
@@ -333,27 +430,33 @@ function EstimateClient() {
     setView(null);
     try {
       setLoading(true);
-      const raw = await callEstimate({
-        query: product.trim(),
-        input: product.trim(),
-        product: product.trim(),
-        originCountry: country.trim(),
-        country: country.trim(),
+      const basePayload = {
+        originCountry: countryName || undefined,
+        originCountryCode: countryCode || undefined,
+        country: countryName || undefined,
         unitPriceUsd: Number(priceNum),
         price: priceNum,
         quantity: qtyNum ?? undefined,
         qty: qtyNum ?? undefined,
         unitWeightKg: weightNum ?? undefined,
         weightKg: weightNum ?? undefined,
-      });
+      };
+
+      let code = hsDigits;
+      let { raw, code: usedCode } = await estimateWithEightToTenFallback(code, basePayload);
+      code = usedCode;
 
       const normalized = normalizeResult(raw, {
-        product: product.trim(),
-        country: country.trim(),
+        product: code,
+        country: countryName || countryCode,
         unitPrice: priceNum,
         qty: qtyNum,
         weightKg: weightNum ?? undefined,
       });
+
+      if (prefilledDesc && !normalized.breakdown.description) {
+        normalized.breakdown.description = prefilledDesc;
+      }
 
       setView(normalized);
       setCalcTime(new Date().toLocaleString());
@@ -368,37 +471,47 @@ function EstimateClient() {
     }
   }
 
-  // Auto-rerun when qty/weight/price change (400ms debounce)
+  /* -----------------------
+     Auto-rerun (qty/weight/price)
+  ------------------------*/
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (!view) return;
-    if (!product.trim() || !country.trim() || !(Number.isFinite(priceNum) && price !== '')) return;
+    if (!hsValid || !hasCountry || !(Number.isFinite(priceNum) && price !== '')) return;
 
     setAutoUpdating(true);
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(async () => {
       try {
-        const raw = await callEstimate({
-          query: view.breakdown.hsCode || product.trim(),
-          input: view.breakdown.hsCode || product.trim(),
-          product: product.trim(),
-          originCountry: country.trim(),
-          country: country.trim(),
+        const basePayload = {
+          originCountry: countryName || undefined,
+          originCountryCode: countryCode || undefined,
+          country: countryName || undefined,
           unitPriceUsd: Number(priceNum),
           price: priceNum,
           quantity: qtyNum ?? undefined,
           qty: qtyNum ?? undefined,
           unitWeightKg: weightNum ?? undefined,
           weightKg: weightNum ?? undefined,
-        });
+        };
+
+        const startCode = (view.breakdown.hsCode || hsDigits).replace(/\D/g, '');
+        const { raw, code: usedCode } = await estimateWithEightToTenFallback(
+          startCode,
+          basePayload,
+        );
 
         const normalized = normalizeResult(raw, {
-          product: product.trim(),
-          country: country.trim(),
+          product: usedCode,
+          country: countryName || countryCode,
           unitPrice: priceNum,
           qty: qtyNum,
           weightKg: weightNum ?? undefined,
         });
+
+        if (prefilledDesc && !normalized.breakdown.description) {
+          normalized.breakdown.description = prefilledDesc;
+        }
 
         setView(normalized);
         setCalcTime(new Date().toLocaleString());
@@ -415,28 +528,33 @@ function EstimateClient() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [qtyNum, weightNum, priceNum]);
 
-  // Use an alternate HS line: update input + URL + recompute
+  /* -----------------------
+     Use an alternate HS line
+  ------------------------*/
   async function selectAlternate(hsCode: string) {
     try {
-      setProduct(hsCode);
+      setHsInput(hsCode);
+      setPrefilledDesc('');
       setLoading(true);
-      const raw = await callEstimate({
-        query: hsCode,
-        input: hsCode,
-        product: hsCode,
-        originCountry: country.trim(),
-        country: country.trim(),
+
+      const basePayload = {
+        originCountry: countryName || undefined,
+        originCountryCode: countryCode || undefined,
+        country: countryName || undefined,
         unitPriceUsd: Number(priceNum),
         price: priceNum,
         quantity: qtyNum ?? undefined,
         qty: qtyNum ?? undefined,
         unitWeightKg: weightNum ?? undefined,
         weightKg: weightNum ?? undefined,
-      });
+      };
+
+      const code = sanitizeHS(hsCode);
+      const { raw, code: usedCode } = await estimateWithEightToTenFallback(code, basePayload);
 
       const normalized = normalizeResult(raw, {
-        product: hsCode,
-        country: country.trim(),
+        product: usedCode,
+        country: countryName || countryCode,
         unitPrice: priceNum,
         qty: qtyNum,
         weightKg: weightNum ?? undefined,
@@ -445,18 +563,15 @@ function EstimateClient() {
       setView(normalized);
       setCalcTime(new Date().toLocaleString());
       const params = new URLSearchParams(window.location.search);
-      params.set('product', hsCode);
+      params.set('hs', usedCode);
       router.replace(`/estimate?${params}`, { scroll: false });
-      setToast({ kind: 'success', msg: `Using ${hsCode}` });
+      setToast({ kind: 'success', msg: `Using ${formatHsCode(usedCode)}` });
     } catch (e: unknown) {
       setToast({ kind: 'error', msg: e instanceof Error ? e.message : 'Failed to use alternate' });
     } finally {
       setLoading(false);
     }
   }
-
-  const money = (n: number | null | undefined) =>
-    n == null || Number.isNaN(n) ? '—' : currency.format(n);
 
   const totalDeclared =
     view?.breakdown?.price != null
@@ -468,35 +583,52 @@ function EstimateClient() {
           : 1)
       : null;
 
-  function handlePrint() {
-    window.print();
-  }
+  const handlePrint = () => window.print();
 
   return (
     <main className="relative min-h-screen bg-indigo-50 flex items-center justify-center px-6">
       <div className="relative z-10 max-w-xl w-full bg-white p-8 rounded-2xl shadow-xl ring-1 ring-black/5 print:shadow-none print:max-w-none print:w-full print:p-0">
         <h1 className="text-2xl font-bold text-gray-900 mb-6 print:mb-3">Duty Estimator</h1>
 
+        {(preSource === 'landing' || preSource === 'manual') && preHs && (
+          <div className="mb-4 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm text-indigo-900">
+            HS code <span className="font-mono">{formatHsCode(preHs)}</span> prefilled
+            {prefilledDesc ? ` — ${prefilledDesc}` : ''}.
+          </div>
+        )}
+
         <form onSubmit={handleEstimate} className="space-y-5 print:hidden">
-          {/* Product */}
+          {/* HS Code only */}
           <div>
-            <label className="block text-sm font-medium text-gray-700">Product</label>
+            <label className="block text-sm font-medium text-gray-700">
+              HS code (6, 8 or 10 digits)
+            </label>
             <input
-              autoFocus
+              autoFocus={!preHs}
               type="text"
-              placeholder="e.g., Sunglasses, 6-digit HS code, or 10-digit HS code"
-              value={product}
-              onChange={(e) => setProduct(e.target.value)}
-              className="mt-1 w-full rounded-lg border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              placeholder="Enter a 6, 8, or 10-digit HS code"
+              value={hsInput}
+              onChange={(e) => {
+                setHsInput(e.target.value);
+                if (preHs) setPrefilledDesc('');
+              }}
+              className={`mt-1 w-full rounded-lg border px-4 py-2 focus:outline-none focus:ring-2 ${
+                hsInput.length === 0 || hsValid
+                  ? 'border-gray-300 focus:ring-blue-500'
+                  : 'border-red-300 focus:ring-red-500'
+              }`}
             />
-            {isMissingHsCode ? (
-              <p className="mt-1 text-xs text-amber-600">
-                Tip: Paste a 6-digit or 10-digit HS code for more accurate rates.
+            {prefilledDesc && (
+              <p className="mt-1 text-xs text-gray-600">
+                Description: <span className="font-medium">{prefilledDesc}</span>
+              </p>
+            )}
+            {hsInput.length > 0 && !hsValid ? (
+              <p className="mt-1 text-xs text-red-600">
+                HS must be 6, 8, or 10 digits (dots/spaces are OK).
               </p>
             ) : (
-              <p className="mt-1 text-xs text-gray-500">
-                Keywords, a 6-digit HS code, or a 10-digit HS code all work.
-              </p>
+              <p className="mt-1 text-xs text-gray-500">Paste a clean HS for best accuracy.</p>
             )}
           </div>
 
@@ -508,6 +640,7 @@ function EstimateClient() {
                 USD
               </span>
               <input
+                ref={priceInputRef}
                 type="number"
                 inputMode="decimal"
                 step="0.01"
@@ -518,25 +651,15 @@ function EstimateClient() {
                 className="w-full rounded-r-lg border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
             </div>
-            {!Number.isFinite(priceNum) || price === '' || priceNum < 0 ? (
-              <p className="mt-1 text-xs text-red-600">Enter a non-negative number.</p>
-            ) : (
-              <p className="mt-1 text-xs text-gray-500">We’ll use {currency.format(priceNum)}.</p>
-            )}
           </div>
 
           {/* Country */}
-          <div>
-            <label className="block text-sm font-medium text-gray-700">Country of origin</label>
-            <input
-              type="text"
-              placeholder="e.g., China"
-              value={country}
-              onChange={(e) => setCountry(e.target.value)}
-              className="mt-1 w-full rounded-lg border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
-            <p className="mt-1 text-xs text-gray-500">Where is it manufactured?</p>
-          </div>
+          <CountrySelect
+            value={countryCode || null}
+            onChange={(code) => setCountryCode(code ?? '')}
+            frequentlyUsed={['CN', 'CA', 'MX', 'JP', 'VN']}
+            placeholder="Select a country…"
+          />
 
           {/* Optional qty/weight */}
           <div className="grid grid-cols-2 gap-3">
@@ -638,13 +761,15 @@ function EstimateClient() {
 
             <div className="text-gray-800 space-y-1">
               <div>
-                Product:{' '}
-                <span className="font-medium">
-                  {view.breakdown.product ? titleCase(view.breakdown.product) : '—'}
+                HS code:{' '}
+                <span className="font-mono">
+                  {view.breakdown.hsCodeFormatted ||
+                    (view.breakdown.hsCode ? formatHsCode(view.breakdown.hsCode) : '—')}
                 </span>
+                {view.breakdown.description ? <> — {view.breakdown.description}</> : null}
               </div>
               <div>
-                Country:{' '}
+                Country of origin:{' '}
                 <span className="font-medium">
                   {view.breakdown.country ? titleCase(view.breakdown.country) : '—'}
                 </span>
@@ -653,44 +778,15 @@ function EstimateClient() {
                 Importing to: <span className="font-medium">United States</span>
               </div>
 
-              {(view.breakdown.hsCodeFormatted ||
-                view.breakdown.hsCode ||
-                view.breakdown.description) && (
-                <div className="flex items-center gap-2 flex-wrap">
-                  <div>
-                    HS code:{' '}
-                    <span className="font-mono">
-                      {view.breakdown.hsCodeFormatted || view.breakdown.hsCode || '—'}
-                    </span>
-                    {view.breakdown.description ? <> — {view.breakdown.description}</> : null}
-                  </div>
-                  {view.breakdown.hsCode && (
-                    <div className="print:hidden">
-                      <button
-                        type="button"
-                        onClick={() => navigator.clipboard.writeText(view.breakdown.hsCode!)}
-                        className="rounded border px-2 py-0.5 text-xs hover:bg-gray-50"
-                      >
-                        Copy HS
-                      </button>
-                      <a
-                        className="rounded border px-2 py-0.5 text-xs hover:bg-gray-50"
-                        target="_blank"
-                        rel="noreferrer"
-                        href={`https://hts.usitc.gov/?query=${view.breakdown.hsCode}`}
-                      >
-                        View on USITC
-                      </a>
-                    </div>
-                  )}
-                </div>
-              )}
-
               <div>Declared price (per unit): {currency.format(view.breakdown.price ?? 0)}</div>
 
               {view.breakdown.qty != null && Number.isFinite(view.breakdown.qty) && (
                 <div className="text-sm text-gray-700">
-                  Total declared value: {currency.format(totalDeclared ?? 0)}
+                  Total declared value:{' '}
+                  {currency.format(
+                    (view.breakdown.price ?? 0) *
+                      (Number(view.breakdown.qty) > 0 ? Number(view.breakdown.qty) : 1),
+                  )}
                   <span className="text-gray-500">
                     {' '}
                     ({currency.format(view.breakdown.price ?? 0)} × {view.breakdown.qty})
@@ -727,42 +823,42 @@ function EstimateClient() {
                   </ul>
                 </div>
               )}
-            </div>
 
-            {/* Alternates */}
-            {view.alternates && view.alternates.length > 0 && (
-              <div className="mt-4 rounded-lg border p-3 print:hidden">
-                <div className="font-medium mb-2">Other close HTS lines</div>
-                <ul className="space-y-2">
-                  {view.alternates.slice(0, 5).map((alt, i) => (
-                    <li key={i} className="flex items-start justify-between gap-3">
-                      <div className="text-sm">
-                        <div className="font-mono">
-                          {alt.hsCodeFormatted || alt.hsCode}{' '}
-                          <span className="text-gray-400">({alt.rateType || 'advalorem'})</span>
+              {/* Alternates */}
+              {view.alternates && view.alternates.length > 0 && (
+                <div className="mt-4 rounded-lg border p-3 print:hidden">
+                  <div className="font-medium mb-2">Other close HTS lines</div>
+                  <ul className="space-y-2">
+                    {view.alternates.slice(0, 5).map((alt, i) => (
+                      <li key={i} className="flex items-start justify-between gap-3">
+                        <div className="text-sm">
+                          <div className="font-mono">
+                            {alt.hsCodeFormatted || formatHsCode(alt.hsCode)}{' '}
+                            <span className="text-gray-400">({alt.rateType || 'advalorem'})</span>
+                          </div>
+                          <div className="text-gray-700">{alt.description}</div>
+                          <div className="text-gray-600 text-xs">
+                            Rate:{' '}
+                            {alt.rate === 0
+                              ? 'Free'
+                              : alt.rate == null
+                                ? '—'
+                                : `${(alt.rate * 100).toFixed(2)}%`}
+                          </div>
                         </div>
-                        <div className="text-gray-700">{alt.description}</div>
-                        <div className="text-gray-600 text-xs">
-                          Rate:{' '}
-                          {alt.rate === 0
-                            ? 'Free'
-                            : alt.rate == null
-                              ? '—'
-                              : `${(alt.rate * 100).toFixed(2)}%`}
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => selectAlternate(alt.hsCode)}
-                        className="shrink-0 rounded border px-2 py-1 text-xs hover:bg-gray-50"
-                      >
-                        Use this
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
+                        <button
+                          type="button"
+                          onClick={() => selectAlternate(alt.hsCode)}
+                          className="shrink-0 rounded border px-2 py-1 text-xs hover:bg-gray-50"
+                        >
+                          Use this
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -771,7 +867,8 @@ function EstimateClient() {
           Rates via USITC HTS API. Calculated{' '}
           <span suppressHydrationWarning>{calcTime || '—'}</span>.
           <span className="block">
-            Does not include special programs or additional duties (e.g., Section 301).
+            May require additional duties (e.g., Section 301/232) depending on origin and program
+            eligibility.
           </span>
         </div>
       </div>

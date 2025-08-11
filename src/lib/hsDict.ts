@@ -1,191 +1,197 @@
 // src/lib/hsDict.ts
+// Fallback-aware HS utilities + dictionary/API lookup
+// Works with 6, 8, or 10 digits. Accepts messy paste (dots/spaces).
 
-export const hsDict: Record<string, { code: string; description: string }> = {
-  // Apparel
-  't-shirt': { code: '610910', description: 'T-shirts of cotton, knitted or crocheted' },
-  shirt: { code: '620520', description: "Men's or boys' shirts of cotton, not knitted" },
-  dress: { code: '620442', description: "Women's or girls' dresses of cotton" },
-  jeans: { code: '620342', description: "Men's or boys' trousers of cotton" },
-  jacket: {
-    code: '620193',
-    description: "Men's or boys' anoraks, windcheaters of man-made fibres",
-  },
+export type Resolution = 'none' | 'numeric' | 'dict' | 'hts';
 
-  // Footwear
-  shoes: { code: '640419', description: 'Footwear with outer soles of rubber or plastics' },
-  sneakers: {
-    code: '640411',
-    description: 'Sports footwear with outer soles of rubber or plastics',
-  },
-  boots: { code: '640391', description: 'Footwear covering the ankle, leather uppers' },
-  sandals: { code: '640319', description: 'Footwear with leather uppers, not covering the ankle' },
-
-  // Electronics
-  laptop: { code: '847130', description: 'Portable digital automatic data processing machines' },
-  'mobile phone': {
-    code: '851712',
-    description: 'Telephones for cellular networks or for other wireless networks',
-  },
-  headphones: {
-    code: '851830',
-    description: 'Headphones and earphones, whether or not with microphone',
-  },
-  television: { code: '852872', description: 'Reception apparatus for television' },
-
-  // Bags & accessories
-  handbag: { code: '420221', description: 'Handbags with outer surface of leather' },
-  backpack: { code: '420292', description: 'Backpacks with outer surface of textile materials' },
-  wallet: { code: '420231', description: 'Wallets and purses with outer surface of leather' },
-  belt: { code: '420330', description: 'Belts of leather or composition leather' },
-
-  // Kitchenware & home
-  'ceramic plate': {
-    code: '691110',
-    description: 'Tableware and kitchenware of porcelain or china',
-  },
-  knife: { code: '821192', description: 'Knives with fixed blades' },
-  fork: { code: '821191', description: 'Table forks' },
-  spoon: { code: '821599', description: 'Other spoons' },
-  'glass cup': { code: '701337', description: 'Drinking glasses of glass' },
-
-  // --- Sporting goods / fitness ---
-  'yoga mat': {
-    code: '950691',
-    description:
-      'Articles and equipment for general physical exercise, gymnastics or athletics (incl. mats)',
-  },
-  'yoga block': { code: '950691', description: 'Blocks for yoga and pilates training' },
-  'yoga strap': { code: '950691', description: 'Straps/belts for yoga and stretching' },
-  'yoga wheel': { code: '950691', description: 'Wheels for yoga flexibility training' },
-  kettlebell: {
-    code: '950691',
-    description:
-      'Articles and equipment for general physical exercise (weights, kettlebells, etc.)',
-  },
-  dumbbell: {
-    code: '950691',
-    description: 'Weights / dumbbells; equipment for general physical exercise',
-  },
-  barbell: { code: '950691', description: 'Barbells and weight plates for strength training' },
-  'weight plate': {
-    code: '950691',
-    description: 'Plates used with barbells or machines for strength training',
-  },
-  'resistance band': {
-    code: '950691',
-    description: 'Elastic exercise bands for strength and flexibility',
-  },
-  'pull up bar': { code: '950691', description: 'Bars for pull-ups and upper body training' },
-  'push up bar': { code: '950691', description: 'Push-up handles/bars for floor exercises' },
-  'jump rope': { code: '950691', description: 'Skipping ropes for fitness training' },
-  'foam roller': {
-    code: '950691',
-    description: 'Foam rollers for self-myofascial release and massage',
-  },
-  'medicine ball': {
-    code: '950691',
-    description: 'Weighted balls for exercise and rehabilitation',
-  },
-  'slam ball': { code: '950691', description: 'Balls designed for slamming exercises' },
-  'exercise ball': { code: '950691', description: 'Stability / Swiss balls for exercise' },
-  'ab roller': { code: '950691', description: 'Abdominal exercise wheels' },
-  'gym mat': { code: '950691', description: 'Mats for floor-based exercise and stretching' },
-  'speed ladder': { code: '950691', description: 'Agility ladders for sports training' },
-  'balance board': { code: '950691', description: 'Boards for balance and core training' },
-  'plyo box': { code: '950691', description: 'Plyometric jump boxes' },
-
-  // Tools
-  hammer: { code: '820520', description: 'Hammers and sledge hammers' },
-  screwdriver: { code: '820540', description: 'Screwdrivers' },
-  wrench: { code: '820411', description: 'Spanners and wrenches, hand-operated' },
-
-  // Toys
-  doll: { code: '950300', description: 'Dolls representing only human beings' },
-  'toy car': {
-    code: '950300',
-    description: 'Other toys representing animals or non-human creatures',
-  },
-  'board game': { code: '950490', description: 'Articles for arcade, table or parlor games' },
-
-  // Jewellery
-  necklace: { code: '711311', description: 'Articles of jewellery of silver' },
-  ring: { code: '711319', description: 'Articles of jewellery of other precious metal' },
-  bracelet: { code: '711311', description: 'Articles of jewellery of silver' },
-
-  // Optical / eyewear
-  sunglasses: { code: '900410', description: 'Sunglasses' },
+export type HsRecord = {
+  hsCode: string; // numeric, no punctuation
+  description: string;
+  // Optional, depending on your pipeline:
+  dutyRate?: number | null; // e.g., 0.02 for 2%
+  notes?: string[];
 };
 
-export const hsAliases: Record<string, string> = {
-  // Apparel
-  tshirts: 't-shirt',
-  tee: 't-shirt',
-  tees: 't-shirt',
-  shirts: 'shirt',
-  dresses: 'dress',
-  pants: 'jeans',
-  trousers: 'jeans',
-  jackets: 'jacket',
+export type HsLookupResult =
+  | { resolution: 'none' }
+  | ({ resolution: Exclude<Resolution, 'none'> } & HsRecord);
 
-  // Footwear
-  trainers: 'sneakers',
-  runners: 'sneakers',
-  boots: 'boots',
-  sandals: 'sandals',
+// -----------------------------
+// Formatting / sanitizing utils
+// -----------------------------
+export function sanitizeHS(raw: string): string {
+  const groups = raw.match(/\d+/g) || [];
+  const digits = groups.join('');
+  if (digits.length <= 10) return digits;
 
-  // Electronics
-  notebook: 'laptop',
-  computer: 'laptop',
-  phone: 'mobile phone',
-  cellphone: 'mobile phone',
-  earphones: 'headphones',
-  tv: 'television',
+  // If someone pastes a verbose "900410.10.0000" with extra digits,
+  // prefer first 6 + last 4 (=> 10)
+  const first6 = digits.slice(0, 6);
+  const last4 = digits.slice(-4);
+  const candidate = `${first6}${last4}`;
+  if (candidate.length === 10) return candidate;
 
-  // Bags & accessories
-  bag: 'handbag',
-  purse: 'handbag',
-  rucksack: 'backpack',
-  belt: 'belt',
+  return digits.slice(0, 10);
+}
 
-  // Kitchenware & home
-  plate: 'ceramic plate',
-  cup: 'glass cup',
-  mug: 'glass cup',
+export function isValidHS(raw: string): boolean {
+  const d = sanitizeHS(raw);
+  return d.length === 6 || d.length === 8 || d.length === 10;
+}
 
-  // Sporting goods plurals and variations
-  'yoga mats': 'yoga mat',
-  'yoga blocks': 'yoga block',
-  'yoga straps': 'yoga strap',
-  'yoga wheels': 'yoga wheel',
-  kettlebells: 'kettlebell',
-  dumbbells: 'dumbbell',
-  barbells: 'barbell',
-  'weight plates': 'weight plate',
-  'resistance bands': 'resistance band',
-  'pull up bars': 'pull up bar',
-  'push up bars': 'push up bar',
-  'jump ropes': 'jump rope',
-  'foam rollers': 'foam roller',
-  'medicine balls': 'medicine ball',
-  'slam balls': 'slam ball',
-  'exercise balls': 'exercise ball',
-  'ab rollers': 'ab roller',
-  'gym mats': 'gym mat',
-  'speed ladders': 'speed ladder',
-  'balance boards': 'balance board',
-  'plyo boxes': 'plyo box',
+// Display: 6->4.2, 8->4.2.2, 10->4.2.4
+export function formatHsCode(code: string): string {
+  const digits = code.replace(/\D/g, '');
+  if (digits.length === 6) return digits.replace(/(\d{4})(\d{2})/, '$1.$2');
+  if (digits.length === 8) return digits.replace(/(\d{4})(\d{2})(\d{2})/, '$1.$2.$3');
+  if (digits.length === 10) return digits.replace(/(\d{4})(\d{2})(\d{4})/, '$1.$2.$3');
+  return code;
+}
 
-  // Toys
-  toy: 'doll',
-  cars: 'toy car',
-  game: 'board game',
+// Candidate order given an initial length.
+// 10 -> [10, 8, 6]
+// 8  -> [8, 10(padded with 00), 6]
+// 6  -> [6]
+function candidateLengths(len: number): Array<6 | 8 | 10> {
+  if (len === 10) return [10, 8, 6];
+  if (len === 8) return [8, 10, 6];
+  return [6];
+}
 
-  // Jewellery
-  chain: 'necklace',
-  rings: 'ring',
-  bangle: 'bracelet',
+// If we move to a shorter candidate, truncate.
+// If we move 8 -> 10, pad with '00' (common US stats pattern).
+function adjustToLength(digits: string, target: 6 | 8 | 10): string {
+  if (target === 6) return digits.slice(0, 6);
+  if (target === 8) return digits.slice(0, 8);
+  // target === 10
+  if (digits.length >= 10) return digits.slice(0, 10);
+  if (digits.length === 8) return `${digits}00`; // 8->10 padding
+  // 6->10 not typical; still allow as 6 + '0000'
+  if (digits.length === 6) return `${digits}0000`;
+  return digits.padEnd(10, '0');
+}
 
-  // Optical / eyewear
-  sunglass: 'sunglasses',
-  shades: 'sunglasses',
+// --------------------------------------------
+// Plug-in lookups (API + local dictionary)
+// --------------------------------------------
+
+// 1) USITC/HTS API numeric lookup.
+// Replace this with your real call (server-side preferred).
+export async function apiLookupNumeric(hs: string, signal?: AbortSignal): Promise<HsLookupResult> {
+  // Example stub: return "none" so dict can still work.
+  // You should replace with your real API call to HTS/USITC.
+  void signal;
+  return { resolution: 'none' };
+}
+
+// 2) Local curated dictionary (fast path).
+// Replace with your real dictionary store. Ship a few seeds for sanity.
+const LOCAL_DICT: Record<string, HsRecord> = {
+  // Sunglasses (good sanity check)
+  '900410': { hsCode: '900410', description: 'Sunglasses' },
+  '90041010': { hsCode: '90041010', description: 'Sunglasses, plastic frames' },
+  '9004100000': { hsCode: '9004100000', description: 'Sunglasses' },
 };
+
+export async function dictLookup(hs: string): Promise<HsLookupResult> {
+  const rec = LOCAL_DICT[hs];
+  if (!rec) return { resolution: 'none' };
+  return { resolution: 'numeric', ...rec };
+}
+
+// --------------------------------------------
+// Fallback-aware resolver
+// --------------------------------------------
+export type ResolverOptions = {
+  signal?: AbortSignal;
+  // Override lookups if you prefer (e.g., inject mocks in tests)
+  api?: (hs: string, signal?: AbortSignal) => Promise<HsLookupResult>;
+  dict?: (hs: string) => Promise<HsLookupResult>;
+};
+
+// Try a single HS code once via dict, then API (or the opposite—tune order if you want).
+async function tryOnce(hs: string, opts: ResolverOptions): Promise<HsLookupResult> {
+  const dict = opts.dict ?? dictLookup;
+  const api = opts.api ?? apiLookupNumeric;
+
+  // Dict first (fast, deterministic)
+  const d = await dict(hs);
+  if (d.resolution !== 'none') return d;
+
+  // API second
+  const a = await api(hs, opts.signal);
+  if (a.resolution !== 'none') return a;
+
+  return { resolution: 'none' };
+}
+
+/**
+ * Resolve an HS code with robust fallbacks:
+ * - Accept messy paste
+ * - Try exact length first
+ * - If 10 fails => 8 => 6
+ * - If 8 fails => 10 (padded '00') => 6
+ * - If 6 exists => return it
+ */
+export async function resolveHsWithFallback(
+  rawInput: string,
+  opts: ResolverOptions = {},
+): Promise<HsLookupResult> {
+  const clean = sanitizeHS(rawInput);
+  if (!clean) return { resolution: 'none' };
+
+  const lengths = candidateLengths(clean.length as 6 | 8 | 10);
+
+  for (const L of lengths) {
+    const candidate = adjustToLength(clean, L);
+    const res = await tryOnce(candidate, opts);
+    if (res.resolution !== 'none') return res;
+
+    // Special case: for 10-length branch, also try the corresponding 8 (truncate) before dropping to 6.
+    if (L === 10 && clean.length === 10) {
+      const as8 = adjustToLength(clean, 8);
+      if (as8 !== candidate) {
+        const res8 = await tryOnce(as8, opts);
+        if (res8.resolution !== 'none') return res8;
+      }
+    }
+  }
+
+  return { resolution: 'none' };
+}
+
+// -----------------------------
+// Convenience: one-shot describe
+// -----------------------------
+export async function describeHs(rawInput: string, opts?: ResolverOptions) {
+  const r = await resolveHsWithFallback(rawInput, opts);
+  if (r.resolution === 'none') {
+    return { resolution: 'none' as const, hsCode: null, description: null };
+  }
+  return {
+    resolution: r.resolution,
+    hsCode: r.hsCode,
+    hsCodeDisplay: formatHsCode(r.hsCode),
+    description: r.description,
+  };
+}
+
+/* --------------------------------------------------------------------
+How to wire in /api/estimate (server route):
+
+import { resolveHsWithFallback } from '@/lib/hsDict';
+
+export async function POST(req: Request) {
+  const { query, ...rest } = await req.json();
+  const hs = await resolveHsWithFallback(query, {
+    api: yourRealHtsApiLookup,   // implement server-side call to USITC/HTS
+    dict: yourRealDictLookup,    // implement your dictionary lookup if you have one
+  });
+
+  if (hs.resolution === 'none') {
+    // return your "no match" shape
+  }
+
+  // Continue: fetch rate for hs.hsCode, compute duty, etc.
+}
+--------------------------------------------------------------------- */
