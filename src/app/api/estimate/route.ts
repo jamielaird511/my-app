@@ -124,10 +124,10 @@ async function htsExportByCode(numericInput: string): Promise<HtsMini[] | null> 
 
   const rows: any[] = Array.isArray(data)
     ? data
-    : Array.isArray(data.results)
-      ? data.results
-      : Array.isArray(data.data)
-        ? data.data
+    : Array.isArray((data as any).results)
+      ? (data as any).results
+      : Array.isArray((data as any).data)
+        ? (data as any).data
         : [];
 
   const minis = rows.map(toHtsMini).filter(Boolean) as HtsMini[];
@@ -149,7 +149,11 @@ async function htsSearchByKeyword(keyword: string): Promise<HtsMini[] | null> {
   const data: any = await res.json().catch(() => null);
   if (!data) return null;
 
-  const rows: any[] = Array.isArray(data) ? data : Array.isArray(data.results) ? data.results : [];
+  const rows: any[] = Array.isArray(data)
+    ? data
+    : Array.isArray((data as any).results)
+      ? (data as any).results
+      : [];
   const minis = rows.map(toHtsMini).filter(Boolean) as HtsMini[];
   const out = minis.length ? minis : null;
   setCache(key, out);
@@ -178,24 +182,30 @@ function dictFallback(input: string) {
   }
 }
 
+/** ---------- Normalization ---------- */
+function pick<T>(...vals: (T | undefined | null)[]) {
+  return vals.find((v) => v !== undefined && v !== null);
+}
+
+function normalizeIncoming(body: any) {
+  const input = (pick(body.query, body.input, body.product) ?? '').toString().trim();
+  const product = (pick(body.product, body.query, body.input) ?? '').toString().trim();
+  const country = (pick(body.originCountry, body.country) ?? 'CN').toString().trim();
+  const price = Number(pick(body.unitPriceUsd, body.price) ?? 0);
+  const qtyRaw = pick(body.quantity, body.qty);
+  const qty = qtyRaw == null ? null : Number(qtyRaw);
+  const weightRaw = pick(body.unitWeightKg, body.weightKg);
+  const weightKg = weightRaw == null ? null : Number(weightRaw);
+
+  return { input, product, country, price, qty, weightKg };
+}
+
 /** ---------- Core handler ---------- */
-async function handleEstimate(params: {
-  input?: string;
-  product?: string;
-  price?: any;
-  country?: string;
-  qty?: any;
-  weightKg?: any;
-}) {
-  const input = String(params.input ?? params.product ?? '').trim();
-  const product = String(params.product ?? input ?? '').trim();
-  const country = String(params.country ?? 'China');
-  const price = Number(params.price ?? 0);
-  const qty = params.qty == null ? null : Number(params.qty);
-  const weightKg = params.weightKg == null ? null : Number(params.weightKg);
+async function handleEstimate(body: any) {
+  const { input, product, country, price, qty, weightKg } = normalizeIncoming(body);
 
   if (!input) {
-    return { error: "Provide 'input' (keyword or HS code)", status: 400 };
+    return { error: "Provide 'query' or 'input' (keyword or HS code)", status: 400 };
   }
 
   let chosen: HtsMini | null = null;
@@ -332,6 +342,7 @@ async function handleEstimate(params: {
       status: 200,
     };
   } catch (err: any) {
+    console.error('[/api/estimate] error:', err);
     return { error: err?.message ?? 'Unexpected error', status: 500 };
   }
 }
@@ -353,12 +364,18 @@ export async function POST(req: NextRequest) {
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const out = await handleEstimate({
+    // support both param styles in GET as well
+    query: searchParams.get('query') ?? undefined,
     input: searchParams.get('input') ?? undefined,
     product: searchParams.get('product') ?? undefined,
     price: searchParams.get('price') ?? undefined,
+    unitPriceUsd: searchParams.get('unitPriceUsd') ?? undefined,
     country: searchParams.get('country') ?? undefined,
+    originCountry: searchParams.get('originCountry') ?? undefined,
     qty: searchParams.get('qty') ?? undefined,
+    quantity: searchParams.get('quantity') ?? undefined,
     weightKg: searchParams.get('weightKg') ?? undefined,
+    unitWeightKg: searchParams.get('unitWeightKg') ?? undefined,
   });
   if ('error' in out) return NextResponse.json({ error: out.error }, { status: out.status });
   return NextResponse.json(out.body, { status: out.status });

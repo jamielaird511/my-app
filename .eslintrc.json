@@ -1,3 +1,18 @@
 {
-  "extends": ["next/core-web-vitals"]
+  "extends": ["next/core-web-vitals"],
+  "plugins": ["import", "@typescript-eslint", "react-hooks"],
+  "rules": {
+    "import/no-unresolved": ["error", { "caseSensitive": true }],
+    "@typescript-eslint/no-explicit-any": "warn",
+    "react-hooks/rules-of-hooks": "error",
+    "react-hooks/exhaustive-deps": "warn"
+  },
+  "overrides": [
+    {
+      "files": ["src/app/estimate/page.tsx", "src/app/hs/page.tsx"],
+      "rules": {
+        "@typescript-eslint/no-explicit-any": "off"
+      }
+    }
+  ]
 }

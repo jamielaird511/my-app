@@ -1,23 +1,45 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import React, { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 
+/* --------------------------------
+   Page wrapper (Suspense required)
+----------------------------------*/
+export default function EstimatePage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-indigo-50 flex items-center justify-center px-6">
+          <div className="max-w-xl w-full bg-white p-6 rounded-2xl shadow ring-1 ring-black/5 text-sm text-gray-600">
+            Loading estimator…
+          </div>
+        </div>
+      }
+    >
+      <EstimateClient />
+    </Suspense>
+  );
+}
+
+/* -----------------------
+   Types (two API shapes)
+------------------------*/
 type Resolution = 'none' | 'dict' | 'numeric' | 'hts';
 type RateComponent =
   | { kind: 'pct'; value: number }
   | { kind: 'amount'; value: number; per: string };
 
-type ApiResult = {
+type DetailedApiResult = {
   duty: number | null;
-  rate: number | null; // 0 => Free
+  rate: number | null;
   rateType: 'advalorem' | 'specific' | 'compound' | null;
   components: RateComponent[];
   resolution: Resolution;
   breakdown: {
     product: string | null;
     country: string | null;
-    price: number | null; // per unit
+    price: number | null;
     hsCode?: string | null;
     hsCodeFormatted?: string | null;
     description?: string | null;
@@ -34,6 +56,46 @@ type ApiResult = {
   notes?: string[];
 };
 
+type SimpleAlternate = { hsCode: string; description: string; dutyRate: number };
+type SimpleApiResult = {
+  hsCode: string;
+  description: string;
+  dutyRate: number;
+  dutyUsd: number;
+  notes?: string[];
+  alternates?: SimpleAlternate[];
+};
+
+type ViewAlt = {
+  hsCode: string;
+  hsCodeFormatted?: string | null;
+  description: string;
+  rate: number | null;
+  rateType: 'advalorem' | 'specific' | 'compound' | null;
+};
+type ViewModel = {
+  duty: number | null;
+  rate: number | null;
+  rateType: 'advalorem' | 'specific' | 'compound' | null;
+  components?: RateComponent[];
+  resolution: Resolution;
+  breakdown: {
+    product: string | null;
+    country: string | null;
+    price: number | null;
+    hsCode?: string | null;
+    hsCodeFormatted?: string | null;
+    description?: string | null;
+    qty?: number | null;
+    weightKg?: number | null;
+  };
+  notes?: string[];
+  alternates?: ViewAlt[];
+};
+
+/* -----------------------
+   Small UI helpers
+------------------------*/
 const currency = new Intl.NumberFormat('en-US', {
   style: 'currency',
   currency: 'USD',
@@ -49,6 +111,23 @@ function titleCase(s: string) {
     .join(' ');
 }
 
+function rateToText(rate: number | null | undefined) {
+  if (rate === 0) return 'Free';
+  if (rate == null) return '—';
+  const pct = rate * 100;
+  return `${pct.toFixed(pct < 1 ? 2 : 1)}%`;
+}
+
+function componentsText(components?: RateComponent[]) {
+  if (!components?.length) return '—';
+  return components
+    .map((c) => (c.kind === 'pct' ? `${(c.value * 100).toFixed(2)}%` : `$${c.value}/${c.per}`))
+    .join(' + ');
+}
+
+/* -----------------------------------
+   Toast + ResolutionBadge components
+------------------------------------*/
 function Toast({
   kind,
   message,
@@ -77,34 +156,95 @@ function ResolutionBadge({ r }: { r: Resolution }) {
   };
   const s = map[r] ?? map.none;
   return (
-    <span
-      className={`rounded-full text-xs px-3 py-1 shadow ${s.className}`}
-      title={`Resolution: ${s.label}`}
-    >
+    <span className={`rounded-full text-xs px-3 py-1 shadow ${s.className}`} title={s.label}>
       {s.label}
     </span>
   );
 }
 
-function rateToText(rate: number | null | undefined) {
-  if (rate === 0) return 'Free';
-  if (rate == null) return '—';
-  const pct = rate * 100;
-  return `${pct.toFixed(pct < 1 ? 2 : 1)}%`;
+/* -----------------------
+   Normalization helpers
+------------------------*/
+function isDetailed(x: unknown): x is DetailedApiResult {
+  return !!x && typeof x === 'object' && 'breakdown' in (x as any) && 'resolution' in (x as any);
+}
+function isSimple(x: unknown): x is SimpleApiResult {
+  return !!x && typeof x === 'object' && 'hsCode' in (x as any) && 'dutyUsd' in (x as any);
 }
 
-function componentsText(components: RateComponent[]) {
-  if (!components?.length) return '—';
-  return components
-    .map((c) => (c.kind === 'pct' ? `${(c.value * 100).toFixed(2)}%` : `$${c.value}/${c.per}`))
-    .join(' + ');
+function normalizeResult(
+  res: DetailedApiResult | SimpleApiResult,
+  input: {
+    product: string;
+    country: string;
+    unitPrice: number;
+    qty?: number | null;
+    weightKg?: number | null;
+  },
+): ViewModel {
+  if (isDetailed(res)) {
+    return {
+      duty: res.duty ?? null,
+      rate: res.rate ?? null,
+      rateType: res.rateType ?? null,
+      components: res.components,
+      resolution: res.resolution ?? 'none',
+      breakdown: {
+        product: res.breakdown.product ?? input.product,
+        country: res.breakdown.country ?? input.country,
+        price: res.breakdown.price ?? input.unitPrice,
+        hsCode: res.breakdown.hsCode ?? undefined,
+        hsCodeFormatted: res.breakdown.hsCodeFormatted ?? undefined,
+        description: res.breakdown.description ?? undefined,
+        qty: res.breakdown.qty ?? input.qty ?? undefined,
+        weightKg: res.breakdown.weightKg ?? input.weightKg ?? undefined,
+      },
+      notes: res.notes ?? [],
+      alternates: res.alternates?.map((a) => ({
+        hsCode: a.hsCode,
+        hsCodeFormatted: a.hsCodeFormatted,
+        description: a.description,
+        rate: a.rate,
+        rateType: a.rateType ?? 'advalorem',
+      })),
+    };
+  }
+
+  return {
+    duty: res.dutyUsd ?? null,
+    rate: res.dutyRate ?? null,
+    rateType: 'advalorem',
+    components: res.dutyRate != null ? [{ kind: 'pct', value: res.dutyRate }] : [],
+    resolution: /^\d{6,10}$/.test(res.hsCode) ? 'numeric' : 'hts',
+    breakdown: {
+      product: input.product,
+      country: input.country,
+      price: input.unitPrice,
+      hsCode: res.hsCode,
+      hsCodeFormatted: undefined,
+      description: res.description,
+      qty: input.qty ?? undefined,
+      weightKg: input.weightKg ?? undefined,
+    },
+    notes: res.notes ?? [],
+    alternates: res.alternates?.map((a) => ({
+      hsCode: a.hsCode,
+      hsCodeFormatted: undefined,
+      description: a.description,
+      rate: a.dutyRate,
+      rateType: 'advalorem',
+    })),
+  };
 }
 
-export default function EstimatePage() {
+/* -----------------------
+   Main client component
+------------------------*/
+function EstimateClient() {
   const search = useSearchParams();
   const router = useRouter();
 
-  // seed from query params (shareable) + localStorage (sticky UX)
+  // seed from query params + localStorage
   const [product, setProduct] = useState(search.get('product') ?? '');
   const [price, setPrice] = useState<string>(
     search.get('price') ??
@@ -126,7 +266,8 @@ export default function EstimatePage() {
   const [loading, setLoading] = useState(false);
   const [autoUpdating, setAutoUpdating] = useState(false);
   const [toast, setToast] = useState<{ kind: 'success' | 'error'; msg: string } | null>(null);
-  const [result, setResult] = useState<ApiResult | null>(null);
+  const [view, setView] = useState<ViewModel | null>(null);
+  const [calcTime, setCalcTime] = useState<string>(''); // client-only timestamp
 
   const priceNum = useMemo(() => Number(price), [price]);
   const qtyNum = useMemo(() => (qty === '' ? null : Number(qty)), [qty]);
@@ -144,7 +285,7 @@ export default function EstimatePage() {
     !loading &&
     !autoUpdating;
 
-  // persist some fields locally (UX)
+  // persist locals
   useEffect(() => {
     if (typeof window === 'undefined') return;
     if (country.trim()) localStorage.setItem('est_country', country.trim());
@@ -153,7 +294,7 @@ export default function EstimatePage() {
     if (weightKg !== '') localStorage.setItem('est_weight', String(weightNum));
   }, [country, price, priceNum, qty, qtyNum, weightKg, weightNum]);
 
-  // shareable URL (US-only; no destination param)
+  // shareable URL
   useEffect(() => {
     const params = new URLSearchParams();
     if (product.trim()) params.set('product', product.trim());
@@ -166,62 +307,103 @@ export default function EstimatePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [product, country, priceNum, qtyNum, weightNum]);
 
-  async function callEstimate(payload: Record<string, any>) {
+  async function callEstimate(payload: Record<string, unknown>) {
     const res = await fetch('/api/estimate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    const data = (await res.json()) as ApiResult | { error?: string };
-    if (!res.ok) throw new Error((data as any)?.error || 'Request failed');
-    return data as ApiResult;
+
+    const text = await res.text();
+    let data: unknown = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      throw new Error(text || `Request failed: ${res.status}`);
+    }
+
+    if (!res.ok) throw new Error((data as any)?.error || text || 'Request failed');
+    return data as DetailedApiResult | SimpleApiResult;
   }
 
   async function handleEstimate(e: React.FormEvent) {
     e.preventDefault();
     if (!canSubmit) return;
 
-    setResult(null);
+    setView(null);
     try {
       setLoading(true);
-      const data = await callEstimate({
+      const raw = await callEstimate({
+        query: product.trim(),
         input: product.trim(),
         product: product.trim(),
+        originCountry: country.trim(),
         country: country.trim(),
+        unitPriceUsd: Number(priceNum),
         price: priceNum,
+        quantity: qtyNum ?? undefined,
         qty: qtyNum ?? undefined,
+        unitWeightKg: weightNum ?? undefined,
         weightKg: weightNum ?? undefined,
       });
-      setResult(data);
+
+      const normalized = normalizeResult(raw, {
+        product: product.trim(),
+        country: country.trim(),
+        unitPrice: priceNum,
+        qty: qtyNum,
+        weightKg: weightNum ?? undefined,
+      });
+
+      setView(normalized);
+      setCalcTime(new Date().toLocaleString());
       setToast({ kind: 'success', msg: 'Estimate ready' });
-    } catch (err: any) {
-      setToast({ kind: 'error', msg: err.message || 'Couldn’t get an estimate' });
+    } catch (err: unknown) {
+      setToast({
+        kind: 'error',
+        msg: err instanceof Error ? err.message : 'Couldn’t get an estimate',
+      });
     } finally {
       setLoading(false);
     }
   }
 
-  // Auto-rerun when qty/weight/price change (400ms debounce) – keeps totals fresh
+  // Auto-rerun when qty/weight/price change (400ms debounce)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
-    if (!result) return;
+    if (!view) return;
     if (!product.trim() || !country.trim() || !(Number.isFinite(priceNum) && price !== '')) return;
 
     setAutoUpdating(true);
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(async () => {
       try {
-        const data = await callEstimate({
-          input: result.breakdown.hsCode || product.trim(), // force numeric if we have it
+        const raw = await callEstimate({
+          query: view.breakdown.hsCode || product.trim(),
+          input: view.breakdown.hsCode || product.trim(),
           product: product.trim(),
+          originCountry: country.trim(),
           country: country.trim(),
+          unitPriceUsd: Number(priceNum),
           price: priceNum,
+          quantity: qtyNum ?? undefined,
           qty: qtyNum ?? undefined,
+          unitWeightKg: weightNum ?? undefined,
           weightKg: weightNum ?? undefined,
         });
-        setResult(data);
-      } catch (e: any) {
-        setToast({ kind: 'error', msg: e?.message || 'Auto-update failed' });
+
+        const normalized = normalizeResult(raw, {
+          product: product.trim(),
+          country: country.trim(),
+          unitPrice: priceNum,
+          qty: qtyNum,
+          weightKg: weightNum ?? undefined,
+        });
+
+        setView(normalized);
+        setCalcTime(new Date().toLocaleString());
+      } catch (e: unknown) {
+        setToast({ kind: 'error', msg: e instanceof Error ? e.message : 'Auto-update failed' });
       } finally {
         setAutoUpdating(false);
       }
@@ -234,25 +416,40 @@ export default function EstimatePage() {
   }, [qtyNum, weightNum, priceNum]);
 
   // Use an alternate HS line: update input + URL + recompute
-  async function useAlternate(hsCode: string) {
+  async function selectAlternate(hsCode: string) {
     try {
       setProduct(hsCode);
       setLoading(true);
-      const data = await callEstimate({
+      const raw = await callEstimate({
+        query: hsCode,
         input: hsCode,
         product: hsCode,
+        originCountry: country.trim(),
         country: country.trim(),
+        unitPriceUsd: Number(priceNum),
         price: priceNum,
+        quantity: qtyNum ?? undefined,
         qty: qtyNum ?? undefined,
+        unitWeightKg: weightNum ?? undefined,
         weightKg: weightNum ?? undefined,
       });
-      setResult(data);
+
+      const normalized = normalizeResult(raw, {
+        product: hsCode,
+        country: country.trim(),
+        unitPrice: priceNum,
+        qty: qtyNum,
+        weightKg: weightNum ?? undefined,
+      });
+
+      setView(normalized);
+      setCalcTime(new Date().toLocaleString());
       const params = new URLSearchParams(window.location.search);
       params.set('product', hsCode);
       router.replace(`/estimate?${params}`, { scroll: false });
       setToast({ kind: 'success', msg: `Using ${hsCode}` });
-    } catch (e: any) {
-      setToast({ kind: 'error', msg: e?.message || 'Failed to use alternate' });
+    } catch (e: unknown) {
+      setToast({ kind: 'error', msg: e instanceof Error ? e.message : 'Failed to use alternate' });
     } finally {
       setLoading(false);
     }
@@ -262,23 +459,22 @@ export default function EstimatePage() {
     n == null || Number.isNaN(n) ? '—' : currency.format(n);
 
   const totalDeclared =
-    result?.breakdown?.price != null
-      ? (result.breakdown.price ?? 0) *
-        (result.breakdown.qty != null &&
-        Number.isFinite(result.breakdown.qty) &&
-        (result.breakdown.qty as number) > 0
-          ? (result.breakdown.qty as number)
+    view?.breakdown?.price != null
+      ? (view.breakdown.price ?? 0) *
+        (view.breakdown.qty != null &&
+        Number.isFinite(view.breakdown.qty) &&
+        (view.breakdown.qty as number) > 0
+          ? (view.breakdown.qty as number)
           : 1)
       : null;
 
-  // Print/PDF – clean print layout
   function handlePrint() {
     window.print();
   }
 
   return (
-    <main className="min-h-screen bg-gray-50 flex items-center justify-center px-6">
-      <div className="max-w-xl w-full bg-white p-8 rounded-2xl shadow print:shadow-none print:max-w-none print:w-full print:p-0">
+    <main className="relative min-h-screen bg-indigo-50 flex items-center justify-center px-6">
+      <div className="relative z-10 max-w-xl w-full bg-white p-8 rounded-2xl shadow-xl ring-1 ring-black/5 print:shadow-none print:max-w-none print:w-full print:p-0">
         <h1 className="text-2xl font-bold text-gray-900 mb-6 print:mb-3">Duty Estimator</h1>
 
         <form onSubmit={handleEstimate} className="space-y-5 print:hidden">
@@ -432,10 +628,10 @@ export default function EstimatePage() {
         </form>
 
         {/* Result card */}
-        {result && (
+        {view && (
           <div className="mt-6 rounded-2xl border p-4 relative">
             <div className="absolute -top-3 right-3 print:hidden">
-              <ResolutionBadge r={result.resolution} />
+              <ResolutionBadge r={view.resolution} />
             </div>
 
             <h2 className="font-semibold mb-2">Estimated Costs</h2>
@@ -444,35 +640,35 @@ export default function EstimatePage() {
               <div>
                 Product:{' '}
                 <span className="font-medium">
-                  {result.breakdown.product ? titleCase(result.breakdown.product) : '—'}
+                  {view.breakdown.product ? titleCase(view.breakdown.product) : '—'}
                 </span>
               </div>
               <div>
                 Country:{' '}
                 <span className="font-medium">
-                  {result.breakdown.country ? titleCase(result.breakdown.country) : '—'}
+                  {view.breakdown.country ? titleCase(view.breakdown.country) : '—'}
                 </span>
               </div>
               <div>
                 Importing to: <span className="font-medium">United States</span>
               </div>
 
-              {(result.breakdown.hsCodeFormatted ||
-                result.breakdown.hsCode ||
-                result.breakdown.description) && (
+              {(view.breakdown.hsCodeFormatted ||
+                view.breakdown.hsCode ||
+                view.breakdown.description) && (
                 <div className="flex items-center gap-2 flex-wrap">
                   <div>
                     HS code:{' '}
                     <span className="font-mono">
-                      {result.breakdown.hsCodeFormatted || result.breakdown.hsCode || '—'}
+                      {view.breakdown.hsCodeFormatted || view.breakdown.hsCode || '—'}
                     </span>
-                    {result.breakdown.description ? <> — {result.breakdown.description}</> : null}
+                    {view.breakdown.description ? <> — {view.breakdown.description}</> : null}
                   </div>
-                  {result.breakdown.hsCode && (
+                  {view.breakdown.hsCode && (
                     <div className="print:hidden">
                       <button
                         type="button"
-                        onClick={() => navigator.clipboard.writeText(result.breakdown.hsCode!)}
+                        onClick={() => navigator.clipboard.writeText(view.breakdown.hsCode!)}
                         className="rounded border px-2 py-0.5 text-xs hover:bg-gray-50"
                       >
                         Copy HS
@@ -481,7 +677,7 @@ export default function EstimatePage() {
                         className="rounded border px-2 py-0.5 text-xs hover:bg-gray-50"
                         target="_blank"
                         rel="noreferrer"
-                        href={`https://hts.usitc.gov/?query=${result.breakdown.hsCode}`}
+                        href={`https://hts.usitc.gov/?query=${view.breakdown.hsCode}`}
                       >
                         View on USITC
                       </a>
@@ -490,43 +686,42 @@ export default function EstimatePage() {
                 </div>
               )}
 
-              <div>Declared price (per unit): {money(result.breakdown.price)}</div>
+              <div>Declared price (per unit): {currency.format(view.breakdown.price ?? 0)}</div>
 
-              {result.breakdown.qty != null && Number.isFinite(result.breakdown.qty) && (
+              {view.breakdown.qty != null && Number.isFinite(view.breakdown.qty) && (
                 <div className="text-sm text-gray-700">
-                  Total declared value: {money(totalDeclared)}
+                  Total declared value: {currency.format(totalDeclared ?? 0)}
                   <span className="text-gray-500">
                     {' '}
-                    ({money(result.breakdown.price)} × {result.breakdown.qty})
+                    ({currency.format(view.breakdown.price ?? 0)} × {view.breakdown.qty})
                   </span>
                 </div>
               )}
 
-              <div>Duty rate: {rateToText(result.rate)}</div>
+              <div>Duty rate: {rateToText(view.rate)}</div>
               <div className="text-sm text-gray-600">
-                Components: {componentsText(result.components)}
+                Components: {componentsText(view.components)}
               </div>
 
               <div className="mt-2 border-t pt-2">
                 <span className="text-sm text-gray-600">
-                  {money(result.breakdown.price)}
-                  {result.breakdown.qty != null && Number.isFinite(result.breakdown.qty)
-                    ? ` × ${result.breakdown.qty} × ${rateToText(result.rate)} =`
-                    : ` × ${rateToText(result.rate)} =`}
+                  {currency.format(view.breakdown.price ?? 0)}
+                  {view.breakdown.qty != null && Number.isFinite(view.breakdown.qty)
+                    ? ` × ${view.breakdown.qty} × ${rateToText(view.rate)} =`
+                    : ` × ${rateToText(view.rate)} =`}
                 </span>{' '}
-                <span className="font-semibold">{money(result.duty)}</span>
-                {(result.breakdown.qty != null || result.breakdown.weightKg != null) && (
+                <span className="font-semibold">{currency.format(view.duty ?? 0)}</span>
+                {(view.breakdown.qty != null || view.breakdown.weightKg != null) && (
                   <div className="text-sm text-gray-600">
-                    (Qty: {result.breakdown.qty ?? '—'}, Weight: {result.breakdown.weightKg ?? '—'}{' '}
-                    kg)
+                    (Qty: {view.breakdown.qty ?? '—'}, Weight: {view.breakdown.weightKg ?? '—'} kg)
                   </div>
                 )}
               </div>
 
-              {Array.isArray(result.notes) && result.notes.length > 0 && (
+              {Array.isArray(view.notes) && view.notes.length > 0 && (
                 <div className="mt-3 rounded-lg bg-amber-50 p-3 text-amber-900 text-sm">
                   <ul className="list-disc pl-5 space-y-1">
-                    {result.notes.map((n, i) => (
+                    {view.notes.map((n, i) => (
                       <li key={i}>{n}</li>
                     ))}
                   </ul>
@@ -535,16 +730,16 @@ export default function EstimatePage() {
             </div>
 
             {/* Alternates */}
-            {result.alternates && result.alternates.length > 0 && (
+            {view.alternates && view.alternates.length > 0 && (
               <div className="mt-4 rounded-lg border p-3 print:hidden">
                 <div className="font-medium mb-2">Other close HTS lines</div>
                 <ul className="space-y-2">
-                  {result.alternates.slice(0, 5).map((alt, i) => (
+                  {view.alternates.slice(0, 5).map((alt, i) => (
                     <li key={i} className="flex items-start justify-between gap-3">
                       <div className="text-sm">
                         <div className="font-mono">
                           {alt.hsCodeFormatted || alt.hsCode}{' '}
-                          <span className="text-gray-400">({alt.rateType})</span>
+                          <span className="text-gray-400">({alt.rateType || 'advalorem'})</span>
                         </div>
                         <div className="text-gray-700">{alt.description}</div>
                         <div className="text-gray-600 text-xs">
@@ -558,7 +753,7 @@ export default function EstimatePage() {
                       </div>
                       <button
                         type="button"
-                        onClick={() => useAlternate(alt.hsCode)}
+                        onClick={() => selectAlternate(alt.hsCode)}
                         className="shrink-0 rounded border px-2 py-1 text-xs hover:bg-gray-50"
                       >
                         Use this
@@ -573,7 +768,8 @@ export default function EstimatePage() {
 
         {/* Trust & timestamp footer */}
         <div className="mt-6 text-xs text-gray-500 text-center print:mt-2">
-          Rates via USITC HTS REST API (General column). Calculated {new Date().toLocaleString()}.
+          Rates via USITC HTS API. Calculated{' '}
+          <span suppressHydrationWarning>{calcTime || '—'}</span>.
           <span className="block">
             Does not include special programs or additional duties (e.g., Section 301).
           </span>
