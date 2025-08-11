@@ -20,18 +20,20 @@ const DEFAULTS: Option[] = [
 ];
 
 type Props = {
-  /** Current value (ISO country code). Accepts either value or selected for compatibility. */
-  value?: string;
-  selected?: string;
+  /** Controlled value. Accepts null/undefined for "no selection". */
+  value?: string | null;
+  /** Back-compat alias some callers use. */
+  selected?: string | null;
 
-  /** Change handlers. Accepts either onChange or setSelected for compatibility. */
+  /** Change handlers: either is fine. */
   onChange?: (code: string) => void;
   setSelected?: (code: string) => void;
 
-  /** Optional list of options; falls back to DEFAULTS. */
+  /** Optional list and “frequently used” codes to surface first. */
   options?: Option[];
+  frequentlyUsed?: string[];
 
-  /** Styling/behavior passthroughs. */
+  /** Misc. */
   className?: string;
   disabled?: boolean;
   placeholder?: string;
@@ -43,11 +45,24 @@ export default function CountrySelect({
   onChange,
   setSelected,
   options = DEFAULTS,
+  frequentlyUsed,
   className,
   disabled,
-  placeholder = 'Select country',
+  placeholder = 'Select country…',
 }: Props) {
+  // normalize to a string for the <select>
   const v = value ?? selected ?? '';
+
+  // simple prioritization: frequent first (deduped), then the rest
+  const seen = new Set<string>();
+  const prioritized: Option[] = [
+    ...(frequentlyUsed
+      ? frequentlyUsed
+          .map((code) => options.find((o) => o.code === code))
+          .filter((o): o is Option => !!o)
+      : []),
+    ...options,
+  ].filter((o) => (seen.has(o.code) ? false : (seen.add(o.code), true)));
 
   return (
     <select
@@ -64,7 +79,7 @@ export default function CountrySelect({
       <option value="" disabled>
         {placeholder}
       </option>
-      {options.map((o) => (
+      {prioritized.map((o) => (
         <option key={o.code} value={o.code}>
           {o.name}
         </option>
