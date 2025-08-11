@@ -129,7 +129,8 @@ export default function HomePage() {
     }
   };
 
-  const useCode = (s: Suggestion) => {
+  // renamed from "useCode" to avoid rules-of-hooks false positive
+  const selectCode = (s: Suggestion) => {
     const params = new URLSearchParams();
     params.set('hs', s.code);
     params.set('desc', s.description);
@@ -207,7 +208,7 @@ export default function HomePage() {
                             {Math.round(s.confidence * 100)}% match
                           </span>
                           <button
-                            onClick={() => useCode(s)}
+                            onClick={() => selectCode(s)}
                             className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-700"
                           >
                             Use this code
