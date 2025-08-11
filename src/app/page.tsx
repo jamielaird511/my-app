@@ -96,12 +96,24 @@ function localGuess(input: string): Suggestion[] {
 }
 
 async function fetchSuggestions(query: string): Promise<Suggestion[]> {
-  // Later: swap to a real backend /api/hs-suggest
-  // try {
-  //   const res = await fetch('/api/hs-suggest', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query }) });
-  //   if (res.ok) return (await res.json()) as Suggestion[];
-  // } catch {}
-  return localGuess(query);
+  if (!query.trim()) return [];
+
+  try {
+    const res = await fetch(`/api/hs/search?q=${encodeURIComponent(query)}`, {
+      cache: 'no-store',
+    });
+    if (!res.ok) throw new Error('bad status');
+
+    const json = await res.json();
+    return (json.items ?? []).map((r: any) => ({
+      code: r.code,
+      description: r.description,
+      confidence: 0.9, // simple placeholder score
+    }));
+  } catch {
+    // If the API hiccups, fall back to local matching
+    return localGuess(query);
+  }
 }
 
 export default function HomePage() {
