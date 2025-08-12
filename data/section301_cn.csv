@@ -1,0 +1,4 @@
+code_prefix,code_len,country_iso,type,rate_percent,starts_on,ends_on,source_url
+9004100000,10,CN,S301,25,2018-07-06,,https://ustr.gov/issue-areas/enforcement/section-301-investigations/tariff-actions
+90041000,8,CN,S301,25,2018-07-06,,https://ustr.gov/issue-areas/enforcement/section-301-investigations/tariff-actions
+900410,6,CN,S301,25,2018-07-06,,https://ustr.gov/issue-areas/enforcement/section-301-investigations/tariff-actions

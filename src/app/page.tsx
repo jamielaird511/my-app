@@ -145,7 +145,6 @@ export default function HomePage() {
     }
   };
 
-  // renamed from "useCode" to avoid rules-of-hooks false positive
   const selectCode = (s: Suggestion) => {
     const params = new URLSearchParams();
     params.set('hs', s.code);
@@ -156,7 +155,7 @@ export default function HomePage() {
 
   const goManual = () => {
     const hs = manualHs.replace(/\D/g, '').slice(0, 10);
-    if (!hs || hs.length < 6) return; // keep it strict
+    if (!hs || hs.length < 6) return;
     const params = new URLSearchParams();
     params.set('hs', hs);
     params.set('source', 'manual');
@@ -165,7 +164,7 @@ export default function HomePage() {
 
   return (
     <main className="min-h-screen bg-white">
-      {/* HERO with AI concierge */}
+      {/* HERO */}
       <section className="relative bg-indigo-200">
         <div className="mx-auto max-w-6xl px-6 py-16 text-center">
           <div className="inline-flex items-center gap-2 rounded-full bg-white/80 px-3 py-1 text-xs font-medium text-indigo-700 ring-1 ring-indigo-300">
@@ -181,7 +180,7 @@ export default function HomePage() {
             need.
           </p>
 
-          {/* AI input */}
+          {/* Input only */}
           <div className="mx-auto mt-8 max-w-2xl">
             <div className="rounded-2xl border border-indigo-300/70 bg-white p-2 shadow-lg ring-1 ring-black/5">
               <div className="flex items-center gap-2 p-2">
@@ -278,7 +277,6 @@ export default function HomePage() {
             </p>
           </div>
 
-          {/* Single CTA only (no HS Lookup anywhere) */}
           <div className="mt-6 flex items-center justify-center">
             <Link
               href="/estimate"
@@ -331,62 +329,6 @@ export default function HomePage() {
               </p>
             </div>
           </div>
-        </div>
-      </section>
-
-      {/* HOW IT WORKS */}
-      <section className="bg-white">
-        <div className="mx-auto max-w-6xl px-6 py-14">
-          <h2 className="mb-8 text-center text-2xl font-semibold text-slate-900">How it works</h2>
-
-          <div className="grid gap-6 md:grid-cols-3">
-            <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm ring-1 ring-black/5">
-              <div className="mb-2 text-sm font-semibold text-indigo-700">01</div>
-              <h3 className="font-semibold text-slate-900">Describe your product</h3>
-              <p className="mt-1 text-sm text-slate-600">
-                Type a plain-English description (e.g., “leather handbags”).
-              </p>
-            </div>
-
-            <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm ring-1 ring-black/5">
-              <div className="mb-2 text-sm font-semibold text-indigo-700">02</div>
-              <h3 className="font-semibold text-slate-900">Pick the best HS code</h3>
-              <p className="mt-1 text-sm text-slate-600">
-                Select a suggested code to pre-fill the estimator.
-              </p>
-            </div>
-
-            <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm ring-1 ring-black/5">
-              <div className="mb-2 text-sm font-semibold text-indigo-700">03</div>
-              <h3 className="font-semibold text-slate-900">Get duty & docs</h3>
-              <p className="mt-1 text-sm text-slate-600">
-                Enter price, quantity, origin; download your checklist.
-              </p>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* CTA STRIP */}
-      <section className="bg-indigo-100">
-        <div className="mx-auto max-w-6xl px-6 py-14 text-center">
-          <h2 className="text-2xl font-semibold text-slate-900">
-            Ready to estimate your next shipment?
-          </h2>
-          <p className="mx-auto mt-2 max-w-2xl text-slate-700">
-            Start with the concierge or jump straight to the estimator.
-          </p>
-          <div className="mt-6 flex items-center justify-center">
-            <Link
-              href="/estimate"
-              className="rounded-xl bg-indigo-600 px-5 py-3 text-white shadow-sm transition hover:bg-indigo-700"
-            >
-              Open Tariff Estimator
-            </Link>
-          </div>
-          <p className="mt-4 text-xs text-slate-600">
-            Rates via USITC HTS. Excludes special programs and extra duties (e.g., Section 301).
-          </p>
         </div>
       </section>
     </main>
