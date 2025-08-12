@@ -127,7 +127,7 @@ const componentsText = (components?: RateComponent[]) =>
         .join(' + ');
 
 /* -----------------------------------
-   Toast + ResolutionBadge components
+   Toast + SourcePill
 ------------------------------------*/
 function Toast({
   kind,
@@ -147,16 +147,20 @@ function Toast({
   return <div className={`${base} ${style}`}>{message}</div>;
 }
 
-function ResolutionBadge({ r }: { r: Resolution }) {
-  const map: Record<Resolution, { label: string; className: string }> = {
-    numeric: { label: 'HTS (Numeric)', className: 'bg-blue-100 text-blue-700' },
-    hts: { label: 'HTS (Keyword)', className: 'bg-indigo-100 text-indigo-700' },
-    dict: { label: 'Dictionary', className: 'bg-gray-100 text-gray-700' },
-    none: { label: 'No Match', className: 'bg-amber-100 text-amber-800' },
+// Map the old "resolution" to a simple source label
+type SourceLabel = 'usitc' | 'local' | 'none';
+const sourceFromResolution = (r: Resolution): SourceLabel =>
+  r === 'dict' ? 'local' : r === 'none' ? 'none' : 'usitc';
+
+function SourcePill({ source }: { source: SourceLabel }) {
+  const map: Record<SourceLabel, { label: string; cls: string }> = {
+    usitc: { label: 'USITC', cls: 'bg-blue-100 text-blue-700' },
+    local: { label: 'Local', cls: 'bg-gray-100 text-gray-700' },
+    none: { label: 'No rate', cls: 'bg-amber-100 text-amber-800' },
   };
-  const s = map[r] ?? map.none;
+  const s = map[source];
   return (
-    <span className={`rounded-full text-xs px-3 py-1 shadow ${s.className}`} title={s.label}>
+    <span className={`ml-2 rounded-full text-[11px] px-2 py-0.5 align-middle ${s.cls}`}>
       {s.label}
     </span>
   );
@@ -165,7 +169,6 @@ function ResolutionBadge({ r }: { r: Resolution }) {
 /* -----------------------
    HS sanitizing & formatting
 ------------------------*/
-// Display: 6->4.2, 8->4.2.2, 10->4.2.4
 function formatHsCode(code: string): string {
   const digits = code.replace(/\D/g, '');
   if (digits.length === 6) return digits.replace(/(\d{4})(\d{2})/, '$1.$2');
@@ -173,21 +176,16 @@ function formatHsCode(code: string): string {
   if (digits.length === 10) return digits.replace(/(\d{4})(\d{2})(\d{4})/, '$1.$2.$3');
   return code;
 }
-
-// Accept messy paste: strip non-digits; if >10 digits, prefer first6+last4; else truncate to 10.
 function sanitizeHS(raw: string) {
   const groups = raw.match(/\d+/g) || [];
   const digits = groups.join('');
   if (digits.length <= 10) return digits;
-
   const first6 = digits.slice(0, 6);
   const last4 = digits.slice(-4);
   const candidate = `${first6}${last4}`;
   if (candidate.length === 10) return candidate;
-
   return digits.slice(0, 10);
 }
-
 function isValidHS(raw: string) {
   const d = sanitizeHS(raw);
   return d.length === 6 || d.length === 8 || d.length === 10;
@@ -269,6 +267,69 @@ function normalizeResult(
 }
 
 /* -----------------------
+   China overlay (Section 301 demo)
+------------------------*/
+
+// demo list; add more as you wish (8 or 10 digits both supported)
+const CHINA_EXTRAS: Record<string, number> = {
+  '84713000': 0.25, // laptops
+  '8471300000': 0.25,
+  '42022100': 0.075, // leather handbags
+  '4202210000': 0.075,
+  '64041100': 0.25, // sports footwear w/ plastic/rubber soles
+  '6404110000': 0.25,
+};
+
+function isChina(code?: string | null, name?: string | null) {
+  if (!code && !name) return false;
+  const cc = (code || '').trim().toUpperCase();
+  const nn = (name || '').trim().toLowerCase();
+  return cc === 'CN' || nn.includes('china');
+}
+
+/** Mutates a cloned view to add the overlay when origin is China */
+function applyChinaOverlay(viewIn: ViewModel): ViewModel {
+  const v: ViewModel = JSON.parse(JSON.stringify(viewIn)); // cheap deep clone
+
+  const hsRaw = (v.breakdown.hsCode || '').replace(/\D/g, '');
+  const extra =
+    CHINA_EXTRAS[hsRaw] ||
+    CHINA_EXTRAS[hsRaw.slice(0, 8)] || // try 8-digit series
+    0;
+
+  if (!extra) return v;
+  if (!isChina((v.breakdown.country || '').slice(0, 2).toUpperCase(), v.breakdown.country || '')) {
+    return v;
+  }
+
+  const basePct = v.rate ?? 0;
+  const newPct = basePct + extra;
+
+  // update components & rate shown
+  const comps = Array.isArray(v.components) ? [...v.components] : [];
+  comps.push({ kind: 'pct', value: extra });
+  v.components = comps;
+  v.rate = newPct;
+
+  // recompute duty shown in the UI (price × qty × pct)
+  const price = Number(v.breakdown.price ?? 0);
+  const qty =
+    v.breakdown.qty != null &&
+    Number.isFinite(Number(v.breakdown.qty)) &&
+    Number(v.breakdown.qty) > 0
+      ? Number(v.breakdown.qty)
+      : 1;
+  v.duty = price * qty * newPct;
+
+  // annotate
+  const notes = Array.isArray(v.notes) ? [...v.notes] : [];
+  notes.push(`Additional Section 301 duty applied for origin China: ${(extra * 100).toFixed(1)}%.`);
+  v.notes = notes;
+
+  return v;
+}
+
+/* -----------------------
    API helpers (with 8->10 fallback)
 ------------------------*/
 async function callEstimate(payload: Record<string, unknown>) {
@@ -289,26 +350,22 @@ async function callEstimate(payload: Record<string, unknown>) {
   return data as DetailedApiResult | SimpleApiResult;
 }
 
-// Try the given code; if it's 8 digits and the response is a "no match", try padding '00' to 10.
 async function estimateWithEightToTenFallback(code: string, basePayload: Record<string, unknown>) {
   const run = (hs: string) => callEstimate({ ...basePayload, query: hs, input: hs, product: hs });
 
   let raw = await run(code);
 
-  // Only fallback if this is a detailed object AND explicitly says no match
   if (code.length === 8 && isDetailed(raw) && raw.resolution === 'none') {
     const padded = `${code}00`;
     try {
       const raw2 = await run(padded);
-      // Use the padded result only if it found something (or if the second shape isn't "detailed none")
       if (!isDetailed(raw2) || raw2.resolution !== 'none') {
         return { raw: raw2, code: padded };
       }
     } catch {
-      // ignore and keep the original raw
+      /* ignore */
     }
   }
-
   return { raw, code };
 }
 
@@ -421,7 +478,7 @@ function EstimateClient() {
   }, [hsValid, hsDigits, prefilledDesc, countryName, countryCode, priceNum, qtyNum, weightNum]);
 
   /* -----------------------
-     Submit handler (with fallback)
+     Submit handler
   ------------------------*/
   async function handleEstimate(e: React.FormEvent) {
     e.preventDefault();
@@ -446,7 +503,7 @@ function EstimateClient() {
       let { raw, code: usedCode } = await estimateWithEightToTenFallback(code, basePayload);
       code = usedCode;
 
-      const normalized = normalizeResult(raw, {
+      let normalized = normalizeResult(raw, {
         product: code,
         country: countryName || countryCode,
         unitPrice: priceNum,
@@ -457,6 +514,9 @@ function EstimateClient() {
       if (prefilledDesc && !normalized.breakdown.description) {
         normalized.breakdown.description = prefilledDesc;
       }
+
+      // 🟣 Apply China overlay
+      normalized = applyChinaOverlay(normalized);
 
       setView(normalized);
       setCalcTime(new Date().toLocaleString());
@@ -501,7 +561,7 @@ function EstimateClient() {
           basePayload,
         );
 
-        const normalized = normalizeResult(raw, {
+        let normalized = normalizeResult(raw, {
           product: usedCode,
           country: countryName || countryCode,
           unitPrice: priceNum,
@@ -512,6 +572,9 @@ function EstimateClient() {
         if (prefilledDesc && !normalized.breakdown.description) {
           normalized.breakdown.description = prefilledDesc;
         }
+
+        // 🟣 Apply overlay on every recompute
+        normalized = applyChinaOverlay(normalized);
 
         setView(normalized);
         setCalcTime(new Date().toLocaleString());
@@ -526,7 +589,7 @@ function EstimateClient() {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [qtyNum, weightNum, priceNum]);
+  }, [qtyNum, weightNum, priceNum, countryCode]);
 
   /* -----------------------
      Use an alternate HS line
@@ -552,13 +615,16 @@ function EstimateClient() {
       const code = sanitizeHS(hsCode);
       const { raw, code: usedCode } = await estimateWithEightToTenFallback(code, basePayload);
 
-      const normalized = normalizeResult(raw, {
+      let normalized = normalizeResult(raw, {
         product: usedCode,
         country: countryName || countryCode,
         unitPrice: priceNum,
         qty: qtyNum,
         weightKg: weightNum ?? undefined,
       });
+
+      // 🟣 Apply overlay
+      normalized = applyChinaOverlay(normalized);
 
       setView(normalized);
       setCalcTime(new Date().toLocaleString());
@@ -752,11 +818,7 @@ function EstimateClient() {
 
         {/* Result card */}
         {view && (
-          <div className="mt-6 rounded-2xl border p-4 relative">
-            <div className="absolute -top-3 right-3 print:hidden">
-              <ResolutionBadge r={view.resolution} />
-            </div>
-
+          <div className="mt-6 rounded-2xl border p-4">
             <h2 className="font-semibold mb-2">Estimated Costs</h2>
 
             <div className="text-gray-800 space-y-1">
@@ -794,7 +856,12 @@ function EstimateClient() {
                 </div>
               )}
 
-              <div>Duty rate: {rateToText(view.rate)}</div>
+              {/* Rate + Source */}
+              <div className="flex items-center">
+                <span>Duty rate: {rateToText(view.rate)}</span>
+                <SourcePill source={sourceFromResolution(view.resolution)} />
+              </div>
+
               <div className="text-sm text-gray-600">
                 Components: {componentsText(view.components)}
               </div>
@@ -813,6 +880,14 @@ function EstimateClient() {
                   </div>
                 )}
               </div>
+
+              {/* Helpful message when no rate found */}
+              {view.rate == null && (
+                <div className="mt-3 rounded-lg bg-amber-50 p-3 text-amber-900 text-sm">
+                  No duty rate found for this HS. Double-check the HS (6–10 digits) or try a nearby
+                  HS using HS Lookup.
+                </div>
+              )}
 
               {Array.isArray(view.notes) && view.notes.length > 0 && (
                 <div className="mt-3 rounded-lg bg-amber-50 p-3 text-amber-900 text-sm">

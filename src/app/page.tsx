@@ -102,16 +102,20 @@ async function fetchSuggestions(query: string): Promise<Suggestion[]> {
     const res = await fetch(`/api/hs/search?q=${encodeURIComponent(query)}`, {
       cache: 'no-store',
     });
-    if (!res.ok) throw new Error('bad status');
+
+    if (!res.ok) throw new Error(`bad status ${res.status}`);
 
     const json = await res.json();
+    console.log('hs/search json:', json); // DEBUG
+
+    // Map API rows -> UI suggestions
     return (json.items ?? []).map((r: any) => ({
       code: r.code,
       description: r.description,
       confidence: 0.9, // simple placeholder score
     }));
-  } catch {
-    // If the API hiccups, fall back to local matching
+  } catch (e) {
+    console.warn('hs/search failed, fallback to localGuess', e);
     return localGuess(query);
   }
 }

@@ -1,414 +1,252 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextRequest, NextResponse } from 'next/server';
-import * as HSD from '@/lib/hsDict';
-import {
-  RateComponent,
-  RateType,
-  HtsMini,
-  parseGeneralRateRich,
-  computeDutyUSD,
-  is10Digit,
-  normalizeNumeric,
-  formatHs,
-} from '@/lib/duty';
+import { createClient } from '@supabase/supabase-js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-/** ---------- Config ---------- */
-const HTS_BASE = 'https://hts.usitc.gov/reststop';
+type RateComponent =
+  | { kind: 'pct'; value: number }
+  | { kind: 'amount'; value: number; per: string };
 
-/** Optional curated dictionary (legacy hsLookup) */
-const hsLookupFn: undefined | ((input: string) => any) = (() => {
-  const cand =
-    (HSD as any)?.hsLookup ??
-    (HSD as any)?.default ??
-    (typeof (HSD as any) === 'function' ? (HSD as any) : undefined);
-  return typeof cand === 'function' ? cand : undefined;
-})();
+type RateType = 'advalorem' | 'specific' | 'compound' | null;
 
-/** In-memory cache (per server instance) */
-const cache = new Map<string, { t: number; data: any }>();
-const TTL_MS = 5 * 60 * 1000;
-function getCache(key: string) {
-  const v = cache.get(key);
-  if (!v) return null;
-  if (Date.now() - v.t > TTL_MS) {
-    cache.delete(key);
-    return null;
-  }
-  return v.data;
+type ApiBody = {
+  query?: string;
+  input?: string;
+  product?: string;
+  price?: number;
+  unitPriceUsd?: number;
+  qty?: number | null;
+  quantity?: number | null;
+  weightKg?: number | null;
+  unitWeightKg?: number | null;
+  country?: string | null;
+  originCountry?: string | null;
+  originCountryCode?: string | null;
+};
+
+function sanitizeHS(raw: string) {
+  const d = (raw.match(/\d+/g) || []).join('');
+  if (d.length <= 10) return d;
+  const first6 = d.slice(0, 6);
+  const last4 = d.slice(-4);
+  return `${first6}${last4}`.slice(0, 10);
 }
-function setCache(key: string, data: any) {
-  cache.set(key, { t: Date.now(), data });
+function padTo10(d: string) {
+  const n = d.replace(/\D/g, '');
+  if (n.length === 10) return n;
+  if (n.length === 8) return `${n}00`;
+  if (n.length === 6) return `${n}0000`;
+  return n.padEnd(10, '0').slice(0, 10);
+}
+function formatHs(code: string) {
+  const d = code.replace(/\D/g, '');
+  if (d.length === 10) return d.replace(/(\d{4})(\d{2})(\d{4})/, '$1.$2.$3');
+  if (d.length === 8) return d.replace(/(\d{4})(\d{2})(\d{2})/, '$1.$2.$3');
+  if (d.length === 6) return d.replace(/(\d{4})(\d{2})/, '$1.$2');
+  return code;
+}
+function pctFromString(s?: string | null): number | null {
+  if (!s) return null;
+  const m = String(s).match(/(\d+(?:\.\d+)?)\s*%/);
+  return m ? Number(m[1]) / 100 : null;
+}
+function sumPct(components: RateComponent[]) {
+  return components
+    .filter((c): c is { kind: 'pct'; value: number } => c.kind === 'pct')
+    .reduce((a, b) => a + b.value, 0);
 }
 
-/** ---------- HTS helpers ---------- */
-function extractGeneralRateField(rec: any): string | null {
-  if (typeof rec?.general_rate === 'string') return rec.general_rate;
-  if (typeof rec?.generalRate === 'string') return rec.generalRate;
-  if (typeof rec?.general === 'string') return rec.general;
-  if (rec?.rates && typeof rec.rates.general === 'string') return rec.rates.general;
-  for (const k of Object.keys(rec || {})) {
-    const v = rec[k];
-    if (typeof v !== 'string') continue;
-    const key = k.toLowerCase();
-    if (key.includes('general') && key.includes('duty')) return v;
-    if (key.includes('general rate')) return v;
-  }
-  return null;
+function pick<T>(...vals: (T | undefined | null)[]) {
+  return vals.find((v) => v !== undefined && v !== null);
 }
 
-function toHtsMini(rec: any): HtsMini | null {
-  const hsCode =
-    rec?.htsno || rec?.htsno_str || rec?.hts_number || rec?.hts || rec?.number || rec?.htsno10;
-  const description =
-    rec?.desc || rec?.description || rec?.article || rec?.short_desc || rec?.item_description;
-  if (!hsCode || !description) return null;
+async function lookupSupabase(hs10: string) {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!; // RLS disabled on table
+  if (!url || !key) return null;
 
-  const rawGeneral = extractGeneralRateField(rec);
-  const rich = parseGeneralRateRich(rawGeneral);
-  let rate: number | null = null;
-  let rateType: RateType = 'specific';
-  let components: RateComponent[] = [];
+  const supabase = createClient(url, key);
+  // exact 10 → 8 → 6
+  const code8 = hs10.slice(0, 8);
+  const code6 = hs10.slice(0, 6);
 
-  if (rich) {
-    rateType = rich.type;
-    components = rich.components;
-    const firstPct = components.find((c) => c.kind === 'pct') as
-      | { kind: 'pct'; value: number }
-      | undefined;
-    rate = firstPct ? firstPct.value : null;
+  let { data: d1 } = await supabase
+    .from('hs_public')
+    .select('code, code8, code6, description, duty_rate')
+    .eq('code', hs10)
+    .limit(1)
+    .maybeSingle();
+
+  if (!d1) {
+    const { data: d2 } = await supabase
+      .from('hs_public')
+      .select('code, code8, code6, description, duty_rate')
+      .eq('code8', code8)
+      .limit(1)
+      .maybeSingle();
+    d1 = d2 || null;
   }
+  if (!d1) {
+    const { data: d3 } = await supabase
+      .from('hs_public')
+      .select('code, code8, code6, description, duty_rate')
+      .eq('code6', code6)
+      .limit(1)
+      .maybeSingle();
+    d1 = d3 || null;
+  }
+  if (!d1) return null;
 
+  const rawRate = Number(d1.duty_rate);
+  const rate = rawRate > 1 ? rawRate / 100 : rawRate; // table may store 4.5 or 0.045
   return {
-    hsCode: String(hsCode).replace(/\D+/g, '').padEnd(10, '0').slice(0, 10),
-    description: String(description).replace(/\s+/g, ' ').trim(),
+    hsCode: hs10,
+    description: d1.description as string,
     rate,
-    rateType,
-    components,
-    _rawGeneral: rawGeneral ?? undefined,
+    components:
+      rate != null ? ([{ kind: 'pct', value: rate }] as RateComponent[]) : ([] as RateComponent[]),
+    rateType: (rate != null ? 'advalorem' : 'specific') as RateType,
+    note: 'Rate from local HS dictionary (Supabase).',
   };
 }
 
-/** ---------- HTS calls (cached, hardened) ---------- */
-async function htsExportByCode(numericInput: string): Promise<HtsMini[] | null> {
-  const code10 = normalizeNumeric(numericInput); // 6->+0000, 8->+00, 10->10
-  if (!code10) return null;
-
-  const key = `export:${code10}`;
-  const cached = getCache(key);
-  if (cached !== undefined) return cached;
-
-  const url = `${HTS_BASE}/exportList?from=${encodeURIComponent(code10)}&to=${encodeURIComponent(
-    code10,
-  )}&format=JSON`;
-
+async function lookupUsitc(hs10: string) {
+  const url = `https://hts.usitc.gov/reststop/exportList?from=${hs10}&to=${hs10}&format=JSON`;
   try {
-    const res = await fetch(url, {
-      cache: 'no-store',
-      headers: { Accept: 'application/json' },
-    });
-
-    if (!res.ok) {
-      console.warn(`[exportList ${code10}] HTTP ${res.status}`);
-      setCache(key, null);
-      return null;
-    }
-
+    const res = await fetch(url, { cache: 'no-store', headers: { Accept: 'application/json' } });
+    if (!res.ok) return null;
     const data: any = await res.json().catch(() => null);
-    if (!data) {
-      console.warn(`[exportList ${code10}] empty JSON`);
-      setCache(key, null);
-      return null;
-    }
-
     const rows: any[] = Array.isArray(data)
       ? data
-      : Array.isArray((data as any).results)
+      : Array.isArray((data as any)?.results)
         ? (data as any).results
-        : Array.isArray((data as any).data)
+        : Array.isArray((data as any)?.data)
           ? (data as any).data
           : [];
+    if (!rows.length) return null;
 
-    const minis = rows.map(toHtsMini).filter(Boolean) as HtsMini[];
-    const out = minis.length ? minis : null;
-    if (!out) console.warn(`[exportList ${code10}] no rows`);
-    setCache(key, out);
-    return out;
-  } catch (e: any) {
-    console.warn(`[exportList ${code10}] fetch failed: ${e?.message}`);
-    setCache(key, null);
-    return null;
-  }
-}
-
-async function htsSearchByKeyword(keyword: string): Promise<HtsMini[] | null> {
-  const q = keyword.toLowerCase().trim();
-  const key = `search:${q}`;
-  const cached = getCache(key);
-  if (cached !== undefined) return cached;
-
-  const url = `${HTS_BASE}/search?keyword=${encodeURIComponent(keyword)}`;
-
-  try {
-    const res = await fetch(url, {
-      cache: 'no-store',
-      headers: { Accept: 'application/json' },
-    });
-
-    if (!res.ok) {
-      console.warn(`[search ${keyword}] HTTP ${res.status}`);
-      setCache(key, null);
-      return null;
-    }
-
-    const data: any = await res.json().catch(() => null);
-    if (!data) {
-      console.warn(`[search ${keyword}] empty JSON`);
-      setCache(key, null);
-      return null;
-    }
-
-    const rows: any[] = Array.isArray(data)
-      ? data
-      : Array.isArray((data as any).results)
-        ? (data as any).results
-        : [];
-    const minis = rows.map(toHtsMini).filter(Boolean) as HtsMini[];
-    const out = minis.length ? minis : null;
-    if (!out) console.warn(`[search ${keyword}] no rows`);
-    setCache(key, out);
-    return out;
-  } catch (e: any) {
-    console.warn(`[search ${keyword}] fetch failed: ${e?.message}`);
-    setCache(key, null);
-    return null;
-  }
-}
-
-/** ---------- Dict fallback ---------- */
-function dictFallback(input: string) {
-  try {
-    if (!hsLookupFn) return null;
-    const hit = hsLookupFn(input); // { hsCode, description, usDutyRate, resolution }
-    if (!hit) return null;
+    const r = rows[0];
+    const desc =
+      r?.desc || r?.description || r?.article || r?.short_desc || r?.item_description || '';
+    const general =
+      r?.general_rate || r?.generalRate || r?.general || (r?.rates && r?.rates.general) || '';
+    const rate = pctFromString(general);
+    const comps: RateComponent[] = rate != null ? [{ kind: 'pct', value: rate }] : [];
     return {
-      hsCode: String(hit.hsCode ?? input).replace(/\D+/g, ''),
-      description: String(hit.description ?? '').trim(),
-      rate: typeof hit.usDutyRate === 'number' ? hit.usDutyRate : null,
-      rateType: (typeof hit.usDutyRate === 'number' ? 'advalorem' : 'specific') as RateType,
-      components:
-        typeof hit.usDutyRate === 'number'
-          ? ([{ kind: 'pct', value: hit.usDutyRate }] as RateComponent[])
-          : [],
-      _dictResolution: hit.resolution,
+      hsCode: hs10,
+      description: String(desc).trim(),
+      rate,
+      components: comps,
+      rateType: rate != null ? ('advalorem' as RateType) : (null as RateType),
+      note: undefined,
     };
   } catch {
     return null;
   }
 }
 
-/** ---------- Normalization ---------- */
-function pick<T>(...vals: (T | undefined | null)[]) {
-  return vals.find((v) => v !== undefined && v !== null);
+function buildOk(body: any, status = 200) {
+  return NextResponse.json(body, { status });
+}
+function buildErr(msg: string, status = 400) {
+  return NextResponse.json({ error: msg }, { status });
 }
 
-function normalizeIncoming(body: any) {
-  const input = (pick(body.query, body.input, body.product) ?? '').toString().trim();
-  const product = (pick(body.product, body.query, body.input) ?? '').toString().trim();
-  const country = (pick(body.originCountry, body.country) ?? 'CN').toString().trim();
-  const price = Number(pick(body.unitPriceUsd, body.price) ?? 0);
-  const qtyRaw = pick(body.quantity, body.qty);
+async function handle(body: ApiBody | URLSearchParams) {
+  const get = (k: string) =>
+    body instanceof URLSearchParams ? (body.get(k) ?? undefined) : (body as any)[k];
+
+  const input = (pick(get('query'), get('input'), get('product')) ?? '').toString().trim();
+  if (!input) return buildErr("Provide 'query' or 'input' (HS code only)", 400);
+
+  const product = (pick(get('product'), get('query'), get('input')) ?? '').toString().trim();
+  const price = Number(pick(get('unitPriceUsd'), get('price')) ?? 0);
+  const qtyRaw = pick(get('qty'), get('quantity'));
   const qty = qtyRaw == null ? null : Number(qtyRaw);
-  const weightRaw = pick(body.unitWeightKg, body.weightKg);
+  const weightRaw = pick(get('unitWeightKg'), get('weightKg'));
   const weightKg = weightRaw == null ? null : Number(weightRaw);
+  const country =
+    (pick(get('originCountry'), get('country'), get('originCountryCode')) as string | undefined) ??
+    null;
 
-  return { input, product, country, price, qty, weightKg };
-}
-
-/** ---------- Core handler (numeric-only with robust fallback) ---------- */
-async function handleEstimate(body: any) {
-  const { input, product, country, price, qty, weightKg } = normalizeIncoming(body);
-
-  if (!input) {
-    return { error: "Provide 'query' or 'input' (HS code only)", status: 400 };
+  const cleaned = sanitizeHS(input);
+  if (!(cleaned.length === 6 || cleaned.length === 8 || cleaned.length === 10)) {
+    return buildErr('HS code must be 6, 8, or 10 digits', 400);
   }
+  const hs10 = padTo10(cleaned);
 
-  // Clean and validate: 6, 8, or 10 digits
-  const clean = HSD.sanitizeHS(input).replace(/\D+/g, '');
-  if (!(clean.length === 6 || clean.length === 8 || clean.length === 10)) {
-    return { error: 'HS code must be 6, 8, or 10 digits', status: 400 };
-  }
+  // 1) Supabase local dictionary
+  const local = await lookupSupabase(hs10);
 
-  let chosen: HtsMini | null = null;
-  let chosenDesc: string | null = null;
-  const notes: string[] = [];
+  // 2) USITC fallback
+  const remote = !local ? await lookupUsitc(hs10) : null;
 
-  try {
-    // Build strict candidate order and ALWAYS try parent 6->10
-    const parent6to10 = `${clean.slice(0, 6)}0000`;
-    const eightToTen = clean.length === 8 ? `${clean}00` : null;
-    const directTen = clean.length === 10 ? clean : null;
+  const hit = local || remote;
 
-    const exportCandidates: string[] = [];
-    if (directTen) exportCandidates.push(directTen);
-    if (eightToTen) exportCandidates.push(eightToTen);
-    exportCandidates.push(parent6to10);
-
-    console.log('[HTS candidates]', { input: clean, exportCandidates });
-
-    // 1) exportList on each candidate
-    for (const cand of exportCandidates) {
-      const minis = await htsExportByCode(cand);
-      console.log('[exportList try]', cand, '=>', minis?.length ?? 0);
-      if (minis && minis.length) {
-        chosen =
-          minis.find((m) => m.hsCode === cand) ??
-          minis.find((m) => is10Digit(m.hsCode)) ??
-          minis[0]!;
-        chosenDesc = chosen.description;
-        break;
-      }
-    }
-
-    // 2) search fallback (numeric keyword) if exportList failed
-    if (!chosen) {
-      const minisSearch = await htsSearchByKeyword(clean);
-      console.log('[search keyword]', clean, '=>', minisSearch?.length ?? 0);
-      if (minisSearch?.length) {
-        const pref = minisSearch
-          .filter((m) => is10Digit(m.hsCode) && m.hsCode.startsWith(clean.slice(0, 6)))
-          .concat(minisSearch);
-        chosen = pref[0] ?? null;
-        chosenDesc = chosen?.description ?? null;
-      }
-    }
-
-    // 3) Local dict fallback (last resort)
-    if (!chosen) {
-      const dict = dictFallback(clean);
-      if (dict) {
-        chosen = {
-          hsCode: dict.hsCode,
-          description: dict.description,
-          rate: dict.rate,
-          rateType: dict.rateType,
-          components: dict.components,
-        };
-        chosenDesc = dict.description;
-      }
-    }
-
-    // 4) No match at all
-    if (!chosen) {
-      return {
-        body: {
-          duty: null,
-          rate: null,
-          rateType: null as any,
-          components: [] as RateComponent[],
-          resolution: 'none' as const,
-          breakdown: {
-            product,
-            country,
-            price,
-            hsCode: null,
-            hsCodeFormatted: null,
-            description: null,
-            qty,
-            weightKg,
-          },
-          alternates: [] as any[],
-          notes: ['No HTS or dictionary match found.'],
-        },
-        status: 200,
-      };
-    }
-
-    // Notes if we had only raw general rate text
-    if (chosen.components.length === 0 && chosen.rate == null && (chosen as any)._rawGeneral) {
-      notes.push(`HTS General (raw): ${(chosen as any)._rawGeneral}`);
-      notes.push('No parseable General rate of duty for this line.');
-    }
-
-    // Duty math
-    let duty: number | null = null;
-    if (chosen.components.length > 0 || chosen.rate != null) {
-      duty = computeDutyUSD({
-        components: chosen.components,
-        priceUSD: price,
+  if (!hit) {
+    return buildOk({
+      duty: null,
+      rate: null,
+      rateType: null as RateType,
+      components: [] as RateComponent[],
+      resolution: 'none' as const,
+      breakdown: {
+        product,
+        country,
+        price,
+        hsCode: null,
+        hsCodeFormatted: null,
+        description: null,
         qty,
         weightKg,
-        notes,
-      });
-    } else {
-      duty = 0;
-    }
-
-    if (chosen.rateType !== 'advalorem') {
-      notes.push(
-        'This line includes specific or compound duties. Provide quantity and/or weight (kg) for the most accurate total.',
-      );
-    }
-
-    return {
-      body: {
-        duty,
-        rate: chosen.rate,
-        rateType: chosen.rateType,
-        components: chosen.components,
-        resolution: 'numeric' as const,
-        breakdown: {
-          product,
-          country,
-          price,
-          hsCode: chosen.hsCode,
-          hsCodeFormatted: formatHs(chosen.hsCode),
-          description: chosenDesc,
-          qty,
-          weightKg,
-        },
-        alternates: [], // you can add neighbors later if needed
-        notes,
       },
-      status: 200,
-    };
-  } catch (err: any) {
-    console.error('[/api/estimate] error:', err);
-    return { error: err?.message ?? 'Unexpected error', status: 500 };
+      alternates: [] as any[],
+      notes: ['No HTS or dictionary match found.'],
+    });
   }
+
+  const notes: string[] = [];
+  if (hit.note) notes.push(hit.note);
+
+  const pctTotal = sumPct(hit.components);
+  const q = qty != null && Number.isFinite(qty) && qty > 0 ? qty : 1;
+  const duty = price * q * pctTotal;
+
+  return buildOk({
+    duty,
+    rate: hit.rate,
+    rateType: hit.rateType,
+    components: hit.components,
+    resolution: local ? ('dict' as const) : ('numeric' as const),
+    breakdown: {
+      product,
+      country,
+      price,
+      hsCode: hit.hsCode,
+      hsCodeFormatted: formatHs(hit.hsCode),
+      description: hit.description,
+      qty,
+      weightKg,
+    },
+    alternates: [] as any[],
+    notes,
+  });
 }
 
-/** ---------- API handlers ---------- */
 export async function POST(req: NextRequest) {
   const raw = await req.text();
   let body: any = {};
   try {
     body = raw ? JSON.parse(raw) : {};
   } catch {
-    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
+    return buildErr('Invalid JSON', 400);
   }
-  const out = await handleEstimate(body);
-  if ('error' in out) return NextResponse.json({ error: out.error }, { status: out.status });
-  return NextResponse.json(out.body, { status: out.status });
+  return handle(body as ApiBody);
 }
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
-  const out = await handleEstimate({
-    query: searchParams.get('query') ?? undefined,
-    input: searchParams.get('input') ?? undefined,
-    product: searchParams.get('product') ?? undefined,
-    price: searchParams.get('price') ?? undefined,
-    unitPriceUsd: searchParams.get('unitPriceUsd') ?? undefined,
-    country: searchParams.get('country') ?? undefined,
-    originCountry: searchParams.get('originCountry') ?? undefined,
-    qty: searchParams.get('qty') ?? undefined,
-    quantity: searchParams.get('quantity') ?? undefined,
-    weightKg: searchParams.get('weightKg') ?? undefined,
-    unitWeightKg: searchParams.get('unitWeightKg') ?? undefined,
-  });
-  if ('error' in out) return NextResponse.json({ error: out.error }, { status: out.status });
-  return NextResponse.json(out.body, { status: out.status });
+  return handle(searchParams);
 }

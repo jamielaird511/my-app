@@ -1,51 +1,42 @@
+// src/app/api/hs/search/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 
-export const dynamic = 'force-dynamic'; // avoid static caching of results
+export const dynamic = 'force-dynamic'; // avoid static caching
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!; // server-only
-const supabase = createClient(supabaseUrl, serviceKey);
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!, // server-only
+);
 
 export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const q = (searchParams.get('q') || '').trim();
-
+  const q = (new URL(req.url).searchParams.get('q') || '').trim();
   if (!q) return NextResponse.json({ items: [] });
 
   const digits = q.replace(/\D/g, '');
 
   try {
-    // If the query looks numeric, try exact/starts-with on codes first
+    // 1) If looks like a code, try exact code6 first
     if (digits.length >= 6) {
       const code6 = digits.slice(0, 6);
-
       const { data, error } = await supabase
-        .from('hs_public') // your table name
+        .from('hs_public')
         .select('*')
         .eq('code6', code6)
         .limit(20);
 
-      if (error) {
-        return NextResponse.json({ error: error.message }, { status: 500 });
-      }
-      if (data && data.length) {
-        return NextResponse.json({ items: data });
-      }
+      if (error) throw error;
+      if (data?.length) return NextResponse.json({ items: data });
     }
 
-    // Fallback: text search on description
-    const { data, error } = await supabase
-      .from('hs_public')
-      .select('*')
-      .ilike('description', `%${q}%`)
-      .limit(25);
+    // 2) Fuzzy text search via RPC (trigram similarity)
+    const { data: rpcData, error: rpcError } = await supabase.rpc('hs_search', {
+      q,
+      limit_n: 25,
+    });
+    if (rpcError) throw rpcError;
 
-    if (error) {
-      return NextResponse.json({ error: error.message }, { status: 500 });
-    }
-
-    return NextResponse.json({ items: data ?? [] });
+    return NextResponse.json({ items: rpcData ?? [] });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? 'Server error' }, { status: 500 });
   }

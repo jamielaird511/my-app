@@ -33,7 +33,7 @@ export default function SiteHeader() {
           <nav aria-label="Primary" className="hidden md:flex items-center gap-1">
             <NavLink href="/">Home</NavLink>
             <NavLink href="/estimate">Estimate</NavLink>
-            <NavLink href="/hs">HS Lookup</NavLink>
+            {/* HS Lookup removed */}
           </nav>
 
           <div className="flex items-center gap-2">
