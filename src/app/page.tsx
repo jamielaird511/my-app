@@ -1,3 +1,4 @@
+// src/app/page.tsx
 'use client';
 
 import { useMemo, useState } from 'react';
@@ -32,92 +33,31 @@ function IconRobot(props: React.SVGProps<SVGSVGElement>) {
   );
 }
 
-/* Lightweight HS suggestion (local fallback) */
-type Suggestion = { code: string; description: string; confidence: number };
+/* Types */
+type Suggestion = {
+  code: string;
+  description: string;
+  confidence: number;
+  reason?: string;
+  mfn_advalorem?: number | null;
+};
 
-const LOCAL_DICTIONARY: Array<{ code: string; aliases: string[]; description: string }> = [
-  {
-    code: '900410',
-    aliases: ['sunglass', 'sunglasses', 'shades', 'eyewear'],
-    description: 'Sunglasses',
-  },
-  {
-    code: '420221',
-    aliases: ['handbag', 'leather bag', 'purse'],
-    description: 'Handbags with outer surface of leather',
-  },
-  { code: '950651', aliases: ['ski', 'skis', 'snow ski'], description: 'Skis (snow) and parts' },
-  {
-    code: '950691',
-    aliases: ['yoga mat', 'yoga', 'exercise mat'],
-    description: 'Articles/equipment for general physical exercise',
-  },
-  {
-    code: '610910',
-    aliases: ['t-shirt', 'tee shirt', 'cotton tshirt', 'tee'],
-    description: 'T-shirts, of cotton, knitted',
-  },
-  {
-    code: '871200',
-    aliases: ['bicycle', 'bike'],
-    description: 'Bicycles and other cycles, not motorized',
-  },
-];
-
-function localGuess(input: string): Suggestion[] {
-  const q = input.trim().toLowerCase();
-
-  // Numeric path: accept 6–10 digits with punctuation stripped, fall back 10→8→6
-  const digits = q.replace(/\D/g, '');
-  const candidates: string[] = [];
-  if (digits.length >= 6) {
-    if (digits.length >= 10) candidates.push(digits.slice(0, 10));
-    if (digits.length >= 8) candidates.push(digits.slice(0, 8));
-    candidates.push(digits.slice(0, 6));
-  }
-  for (const c of candidates) {
-    const hit = LOCAL_DICTIONARY.find((d) => c.startsWith(d.code));
-    if (hit) return [{ code: hit.code, description: hit.description, confidence: 0.9 }];
-  }
-
-  // Keyword path
-  const scored = LOCAL_DICTIONARY.map((d) => {
-    let score = 0;
-    for (const a of d.aliases) if (q.includes(a)) score += 1;
-    const tokens = q.split(/\s+/);
-    for (const t of tokens) if (d.aliases.some((a) => a.includes(t))) score += 0.3;
-    return { code: d.code, description: d.description, confidence: Math.min(0.95, score / 2) };
-  })
-    .filter((s) => s.confidence > 0.35)
-    .sort((a, b) => b.confidence - a.confidence)
-    .slice(0, 3);
-
-  return scored;
-}
-
+/* API call -> suggestions */
 async function fetchSuggestions(query: string): Promise<Suggestion[]> {
   if (!query.trim()) return [];
+  const res = await fetch(`/api/hs/search?q=${encodeURIComponent(query)}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
 
-  try {
-    const res = await fetch(`/api/hs/search?q=${encodeURIComponent(query)}`, {
-      cache: 'no-store',
-    });
-
-    if (!res.ok) throw new Error(`bad status ${res.status}`);
-
-    const json = await res.json();
-    console.log('hs/search json:', json); // DEBUG
-
-    // Map API rows -> UI suggestions
-    return (json.items ?? []).map((r: any) => ({
-      code: r.code,
-      description: r.description,
-      confidence: 0.9, // simple placeholder score
-    }));
-  } catch (e) {
-    console.warn('hs/search failed, fallback to localGuess', e);
-    return localGuess(query);
-  }
+  // IMPORTANT: our API returns { hits: [...] }
+  const hits = Array.isArray(json.hits) ? json.hits : [];
+  return hits.map((h: any) => ({
+    code: h.code,
+    description: h.description ?? '',
+    confidence: typeof h.confidence === 'number' ? h.confidence : 0.8,
+    reason: h.reason,
+    mfn_advalorem: h.mfn_advalorem ?? null,
+  }));
 }
 
 export default function HomePage() {
@@ -138,8 +78,9 @@ export default function HomePage() {
     try {
       const res = await fetchSuggestions(query);
       setSuggestions(res ?? []);
-    } catch {
-      setError('Something went wrong. Try a simpler description.');
+    } catch (e: any) {
+      setError(e?.message || 'Something went wrong. Try a simpler description.');
+      setSuggestions([]);
     } finally {
       setLoading(false);
     }
@@ -180,7 +121,7 @@ export default function HomePage() {
             need.
           </p>
 
-          {/* Input only */}
+          {/* Input + button + results */}
           <div className="mx-auto mt-8 max-w-2xl">
             <div className="rounded-2xl border border-indigo-300/70 bg-white p-2 shadow-lg ring-1 ring-black/5">
               <div className="flex items-center gap-2 p-2">
@@ -191,7 +132,7 @@ export default function HomePage() {
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && !heroCtaDisabled) handleFindHs();
                   }}
-                  placeholder="e.g. leather handbags"
+                  placeholder='e.g. "leather handbags" or 900410'
                   className="flex-1 bg-transparent text-sm outline-none placeholder:text-slate-400"
                 />
                 <button
@@ -199,11 +140,10 @@ export default function HomePage() {
                   disabled={heroCtaDisabled}
                   className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-indigo-700 disabled:opacity-50"
                 >
-                  {loading ? 'Thinking…' : 'Find my HS code'}
+                  {loading ? 'Searching…' : 'Find my HS code'}
                 </button>
               </div>
 
-              {/* Results */}
               <div className="border-t border-slate-200/70 p-3 text-left">
                 {error && <div className="text-sm text-red-600">{error}</div>}
 
@@ -212,15 +152,27 @@ export default function HomePage() {
                     {suggestions.map((s) => (
                       <li
                         key={s.code}
-                        className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-3 py-2"
+                        className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 hover:bg-indigo-50"
                       >
                         <div className="min-w-0">
-                          <div className="text-sm font-semibold text-slate-900">{s.code}</div>
+                          <div className="flex items-center gap-2">
+                            <div className="text-sm font-semibold text-slate-900">{s.code}</div>
+                            {s.reason && (
+                              <span className="text-[10px] uppercase text-slate-500">
+                                {s.reason}
+                              </span>
+                            )}
+                          </div>
                           <div className="truncate text-xs text-slate-600">{s.description}</div>
+                          {typeof s.mfn_advalorem === 'number' && (
+                            <div className="text-[11px] text-slate-500 mt-0.5">
+                              Duty: {s.mfn_advalorem}% (MFN)
+                            </div>
+                          )}
                         </div>
                         <div className="flex items-center gap-2">
                           <span className="text-[10px] text-slate-500">
-                            {Math.round(s.confidence * 100)}% match
+                            {Math.round((s.confidence ?? 0.8) * 100)}% match
                           </span>
                           <button
                             onClick={() => selectCode(s)}

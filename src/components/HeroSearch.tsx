@@ -1,166 +1,160 @@
+// src/components/HeroSearch.tsx
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 
 type Hit = {
   code: string;
-  description: string;
+  code_len: number | null;
+  description: string | null;
+  mfn_advalorem: number | null;
+  mfn_specific: string | null;
+  rev_number: string | null;
+  rev_date: string | null;
   confidence: number;
   reason: string;
-  mfn_advalorem: number | null;
 };
 
 export default function HeroSearch() {
   const [q, setQ] = useState('');
   const [hits, setHits] = useState<Hit[]>([]);
-  const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [idx, setIdx] = useState(-1);
-  const boxRef = useRef<HTMLDivElement>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [active, setActive] = useState<number>(-1);
   const router = useRouter();
 
-  // Debounced search
-  useEffect(() => {
-    if (!q.trim()) {
+  // simple debounce to avoid hammering the API while typing
+  const debounceMs = 300;
+  const tRef = useRef<number | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  function openEstimator(code: string) {
+    router.push(`/estimate?hs=${encodeURIComponent(code)}`);
+  }
+
+  async function runSearch(term: string) {
+    const query = term.trim();
+    if (!query) {
       setHits([]);
-      setOpen(false);
-      setIdx(-1);
+      setErr(null);
+      setLoading(false);
       return;
     }
-    const t = setTimeout(async () => {
-      try {
-        setLoading(true);
-        const res = await fetch(`/api/hs/search?q=${encodeURIComponent(q)}`, { cache: 'no-store' });
-        const json = await res.json();
-        const items: Hit[] = json?.hits ?? [];
-        setHits(items);
-        setOpen(items.length > 0);
-        setIdx(items.length ? 0 : -1);
-      } catch {
+
+    // cancel previous in-flight request
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
+
+    setLoading(true);
+    setErr(null);
+
+    try {
+      const r = await fetch(`/api/hs/search?q=${encodeURIComponent(query)}`, {
+        signal: ac.signal,
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      setHits(Array.isArray(j.hits) ? j.hits : []);
+      setActive(-1);
+    } catch (e: any) {
+      if (e?.name !== 'AbortError') {
+        setErr(e?.message || 'Search failed');
         setHits([]);
-        setOpen(false);
-      } finally {
-        setLoading(false);
       }
-    }, 250);
-    return () => clearTimeout(t);
-  }, [q]);
-
-  // Close dropdown if you click outside
-  useEffect(() => {
-    const onClickAway = (e: MouseEvent) => {
-      if (!boxRef.current) return;
-      if (!boxRef.current.contains(e.target as Node)) setOpen(false);
-    };
-    window.addEventListener('mousedown', onClickAway);
-    return () => window.removeEventListener('mousedown', onClickAway);
-  }, []);
-
-  function goToEstimateWithCode(code: string) {
-    router.push(`/estimate?code=${encodeURIComponent(code)}`);
-  }
-
-  function handleSelect(h: Hit) {
-    setOpen(false);
-    if (h?.code) return goToEstimateWithCode(h.code);
-    // fallback: send raw query
-    router.push(`/estimate?query=${encodeURIComponent(q)}`);
-  }
-
-  function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (!open || hits.length === 0) return;
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      setIdx((i) => (i + 1) % hits.length);
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      setIdx((i) => (i - 1 + hits.length) % hits.length);
-    } else if (e.key === 'Enter') {
-      e.preventDefault();
-      if (idx >= 0 && idx < hits.length) handleSelect(hits[idx]);
-    } else if (e.key === 'Escape') {
-      setOpen(false);
+    } finally {
+      setLoading(false);
     }
   }
 
-  // Decide what clicking the purple "Find my HS code" button does
-  const primaryAction = useMemo(() => {
-    if (hits.length > 0) return () => handleSelect(hits[0]); // choose top result
-    // if numeric, jump straight to estimate; otherwise send query to estimate to let it decide
-    const digits = (q.match(/\d+/g) || []).join('');
-    if (digits.length >= 6) return () => goToEstimateWithCode(formatHsFromDigits(digits));
-    return () => router.push(`/estimate?query=${encodeURIComponent(q)}`);
-  }, [hits, q]);
+  // Debounced search as the user types
+  useEffect(() => {
+    window.clearTimeout(tRef.current as any);
+    tRef.current = window.setTimeout(() => runSearch(q), debounceMs) as any;
+    return () => window.clearTimeout(tRef.current as any);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [q]);
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (!hits.length) {
+      if (e.key === 'Enter') runSearch(q); // manual trigger
+      return;
+    }
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setActive((i) => (i + 1) % hits.length);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setActive((i) => (i - 1 + hits.length) % hits.length);
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const target = hits[Math.max(0, active)];
+      if (target) openEstimator(target.code);
+    }
+  }
 
   return (
-    <div ref={boxRef} className="relative w-full">
-      {/* Your existing shell styling; keep it as-is */}
-      <div className="flex items-center gap-2 rounded-2xl border border-gray-200 bg-white px-4 py-3 shadow-sm">
-        {/* left icon keeps your look */}
-        <svg width="18" height="18" viewBox="0 0 24 24" className="opacity-70">
-          <path
-            fill="currentColor"
-            d="m21.53 20.47l-4.66-4.66A7.94 7.94 0 1 0 16 17.34l4.66 4.66zM4 10a6 6 0 1 1 6 6a6 6 0 0 1-6-6"
-          />
-        </svg>
-
+    <div className="w-full max-w-3xl mx-auto">
+      <div className="flex gap-2">
         <input
-          className="w-full bg-transparent outline-none placeholder:text-gray-400"
-          placeholder="e.g. leather handbags"
           value={q}
           onChange={(e) => setQ(e.target.value)}
           onKeyDown={onKeyDown}
+          placeholder='Try "leather handbags" or 900410'
+          className="flex-1 rounded-xl border border-indigo-200 bg-white px-4 py-3 text-gray-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+          aria-label="Describe your product or enter an HS code"
         />
-
         <button
-          type="button"
-          onClick={primaryAction}
-          className="rounded-xl bg-indigo-500 px-4 py-2 text-white hover:bg-indigo-600"
+          onClick={() => runSearch(q)}
+          className="rounded-xl bg-indigo-600 px-4 py-3 text-white shadow hover:bg-indigo-700"
+          aria-label="Find my HS code"
         >
           Find my HS code
         </button>
       </div>
 
-      {/* loading hint */}
-      {loading && q && <div className="mt-2 text-xs text-gray-500">Searching…</div>}
+      {/* status line */}
+      <div className="mt-2 text-sm text-gray-600 min-h-[1.25rem]">
+        {loading && 'Searching…'}
+        {err && <span className="text-red-600">{err}</span>}
+        {!loading &&
+          !err &&
+          hits.length === 0 &&
+          q.trim() &&
+          'No matches yet. Try simpler wording or a different term.'}
+      </div>
 
-      {/* dropdown */}
-      {open && hits.length > 0 && (
-        <div className="absolute z-50 mt-2 w-full overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-xl">
-          <ul className="divide-y divide-gray-100">
-            {hits.map((h, i) => {
-              const active = i === idx;
-              return (
-                <li
-                  key={`${h.code}-${i}`}
-                  className={`cursor-pointer px-4 py-3 text-sm ${active ? 'bg-gray-50' : ''}`}
-                  onMouseEnter={() => setIdx(i)}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => handleSelect(h)}
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="font-medium tabular-nums">{h.code}</div>
-                    <div className="text-[11px] text-gray-500">
-                      {Math.round(h.confidence * 100)}%
-                    </div>
-                  </div>
-                  <div className="mt-0.5 text-gray-700">{h.description}</div>
-                  <div className="mt-1 text-[11px] text-gray-400">{h.reason}</div>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
+      {/* results */}
+      {hits.length > 0 && (
+        <ul className="mt-4 divide-y divide-gray-200 rounded-xl bg-white shadow" role="listbox">
+          {hits.map((it, i) => {
+            const activeCls = i === active ? 'bg-indigo-50' : '';
+            return (
+              <li
+                key={`${it.code}-${i}`}
+                role="option"
+                aria-selected={i === active}
+                className={`px-4 py-3 cursor-pointer hover:bg-indigo-50 ${activeCls}`}
+                onMouseEnter={() => setActive(i)}
+                onClick={() => openEstimator(it.code)}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="font-medium text-gray-900">{it.code}</div>
+                  <span className="ml-3 text-xs text-gray-500 uppercase">{it.reason}</span>
+                </div>
+                <div className="text-sm text-gray-700">
+                  {it.description || '—'}
+                  {typeof it.mfn_advalorem === 'number' && (
+                    <span className="ml-2 text-gray-500">• Duty: {it.mfn_advalorem}%</span>
+                  )}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
       )}
     </div>
   );
-}
-
-/** helper: format 6/8/10-digit input into dotted HS for estimator route */
-function formatHsFromDigits(d: string) {
-  if (d.length >= 10) return `${d.slice(0, 4)}.${d.slice(4, 6)}.${d.slice(6, 10)}`;
-  if (d.length >= 8) return `${d.slice(0, 4)}.${d.slice(4, 6)}.${d.slice(6, 8)}00`;
-  if (d.length >= 6) return `${d.slice(0, 4)}.${d.slice(4, 6)}.0000`;
-  return d;
 }
