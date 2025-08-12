@@ -1,3 +1,4 @@
+// src/app/estimate/page.tsx
 'use client';
 
 import React, { Suspense, useEffect, useMemo, useRef, useState } from 'react';
@@ -28,19 +29,20 @@ export default function EstimatePage() {
    Types (two API shapes)
 ------------------------*/
 type Resolution = 'none' | 'dict' | 'numeric' | 'hts';
+
 type RateComponent =
-  | { kind: 'pct'; value: number }
+  | { kind: 'pct'; value: number } // 0.05 = 5%
   | { kind: 'amount'; value: number; per: string };
 
 type DetailedApiResult = {
   duty: number | null;
-  rate: number | null;
+  rate: number | null; // 0.05 = 5%
   rateType: 'advalorem' | 'specific' | 'compound' | null;
   components: RateComponent[];
   resolution: Resolution;
   breakdown: {
     product: string | null;
-    country: string | null;
+    country: string | null; // name or code
     price: number | null;
     hsCode?: string | null;
     hsCodeFormatted?: string | null;
@@ -62,7 +64,7 @@ type SimpleAlternate = { hsCode: string; description: string; dutyRate: number }
 type SimpleApiResult = {
   hsCode: string;
   description: string;
-  dutyRate: number;
+  dutyRate: number; // 0.05 = 5%
   dutyUsd: number;
   notes?: string[];
   alternates?: SimpleAlternate[];
@@ -75,9 +77,10 @@ type ViewAlt = {
   rate: number | null;
   rateType: 'advalorem' | 'specific' | 'compound' | null;
 };
+
 type ViewModel = {
   duty: number | null;
-  rate: number | null;
+  rate: number | null; // 0.05 = 5%
   rateType: 'advalorem' | 'specific' | 'compound' | null;
   components?: RateComponent[];
   resolution: Resolution;
@@ -147,7 +150,6 @@ function Toast({
   return <div className={`${base} ${style}`}>{message}</div>;
 }
 
-// Map the old "resolution" to a simple source label
 type SourceLabel = 'usitc' | 'local' | 'none';
 const sourceFromResolution = (r: Resolution): SourceLabel =>
   r === 'dict' ? 'local' : r === 'none' ? 'none' : 'usitc';
@@ -231,7 +233,7 @@ function normalizeResult(
       notes: res.notes ?? [],
       alternates: res.alternates?.map((a) => ({
         hsCode: a.hsCode,
-        hsCodeFormatted: a.hsCodeFormatted,
+        hsCodeFormatted: a.hsCodeFormatted ?? undefined,
         description: a.description,
         rate: a.rate,
         rateType: a.rateType ?? 'advalorem',
@@ -239,6 +241,7 @@ function normalizeResult(
     };
   }
 
+  // Simple shape
   return {
     duty: res.dutyUsd ?? null,
     rate: res.dutyRate ?? null,
@@ -267,51 +270,30 @@ function normalizeResult(
 }
 
 /* -----------------------
-   China overlay (Section 301 demo)
+   Country-based base rates (demo)
 ------------------------*/
-
-// demo list; add more as you wish (8 or 10 digits both supported)
-const CHINA_EXTRAS: Record<string, number> = {
-  '84713000': 0.25, // laptops
-  '8471300000': 0.25,
-  '42022100': 0.075, // leather handbags
-  '4202210000': 0.075,
-  '64041100': 0.25, // sports footwear w/ plastic/rubber soles
-  '6404110000': 0.25,
+const BASE_BY_ORIGIN: Record<string, number> = {
+  CN: 0, // handled by Section 301 overlay
+  CA: 0.0,
+  MX: 0.0,
+  JP: 0.0,
+  VN: 0.0,
+  OTHER: 0.0,
 };
 
-function isChina(code?: string | null, name?: string | null) {
-  if (!code && !name) return false;
-  const cc = (code || '').trim().toUpperCase();
-  const nn = (name || '').trim().toLowerCase();
-  return cc === 'CN' || nn.includes('china');
-}
+/** Apply a simple base rate override if API/enrich returned none. */
+function applyOverrides(viewIn: ViewModel, originAlpha2: string | null | undefined): ViewModel {
+  const v: ViewModel = JSON.parse(JSON.stringify(viewIn));
+  if (v.rate != null) return v;
 
-/** Mutates a cloned view to add the overlay when origin is China */
-function applyChinaOverlay(viewIn: ViewModel): ViewModel {
-  const v: ViewModel = JSON.parse(JSON.stringify(viewIn)); // cheap deep clone
+  const code = (originAlpha2 || '').toUpperCase();
+  const overrideBase = BASE_BY_ORIGIN[code] ?? BASE_BY_ORIGIN.OTHER;
 
-  const hsRaw = (v.breakdown.hsCode || '').replace(/\D/g, '');
-  const extra =
-    CHINA_EXTRAS[hsRaw] ||
-    CHINA_EXTRAS[hsRaw.slice(0, 8)] || // try 8-digit series
-    0;
+  v.rate = overrideBase;
+  v.rateType = 'advalorem';
+  v.components = [{ kind: 'pct', value: overrideBase }];
+  if (v.resolution === 'none') v.resolution = 'dict';
 
-  if (!extra) return v;
-  if (!isChina((v.breakdown.country || '').slice(0, 2).toUpperCase(), v.breakdown.country || '')) {
-    return v;
-  }
-
-  const basePct = v.rate ?? 0;
-  const newPct = basePct + extra;
-
-  // update components & rate shown
-  const comps = Array.isArray(v.components) ? [...v.components] : [];
-  comps.push({ kind: 'pct', value: extra });
-  v.components = comps;
-  v.rate = newPct;
-
-  // recompute duty shown in the UI (price × qty × pct)
   const price = Number(v.breakdown.price ?? 0);
   const qty =
     v.breakdown.qty != null &&
@@ -319,9 +301,87 @@ function applyChinaOverlay(viewIn: ViewModel): ViewModel {
     Number(v.breakdown.qty) > 0
       ? Number(v.breakdown.qty)
       : 1;
-  v.duty = price * qty * newPct;
+  v.duty = price * qty * overrideBase;
 
-  // annotate
+  return v;
+}
+
+/* -----------------------
+   China overlay (Section 301 demo)
+------------------------*/
+// demo list; add more as you wish (supports 6, 8, 10 digits)
+const CHINA_EXTRAS: Record<string, number> = {
+  // Laptops
+  '847130': 0.25,
+  '84713000': 0.25,
+  '8471300000': 0.25,
+
+  // Handbags (leather) – use the 4202.22 family to match 4202.22.1500
+  '420222': 0.075,
+  '42022200': 0.075,
+  '4202221500': 0.075,
+
+  // Sports footwear w/ plastic/rubber soles
+  '640411': 0.25,
+  '64041100': 0.25,
+  '6404110000': 0.25,
+};
+
+/** Country check (accepts code 'CN' or name containing 'china') */
+function isChina(code?: string | null, name?: string | null) {
+  if (!code && !name) return false;
+  const cc = (code || '').trim().toUpperCase();
+  const nn = (name || '').trim().toLowerCase();
+  return cc === 'CN' || nn.includes('china');
+}
+
+/** Find the best extra rate for an HS code by trying 10 -> 8 -> 6 digits */
+function extraForHs(hs?: string | null): number {
+  const d = (hs || '').replace(/\D/g, '');
+  if (!d) return 0;
+  return CHINA_EXTRAS[d] ?? CHINA_EXTRAS[d.slice(0, 8)] ?? CHINA_EXTRAS[d.slice(0, 6)] ?? 0;
+}
+
+/** Recompute duty from view, given a percentage rate */
+function recomputeDutyFrom(view: ViewModel, rate: number | null): number | null {
+  if (rate == null) return null;
+  const price = Number(view.breakdown.price ?? 0);
+  const qty =
+    view.breakdown.qty != null &&
+    Number.isFinite(Number(view.breakdown.qty)) &&
+    Number(view.breakdown.qty) > 0
+      ? Number(view.breakdown.qty)
+      : 1;
+  return price * qty * rate;
+}
+
+/** Mutates a clone of the view to add China overlay when applicable */
+function applyChinaOverlay(viewIn: ViewModel): ViewModel {
+  const v: ViewModel = JSON.parse(JSON.stringify(viewIn)); // deep-ish clone
+
+  // Only apply when origin is China
+  const originIsChina = isChina((v.breakdown.country || '').slice(0, 2), v.breakdown.country || '');
+  if (!originIsChina) return v;
+
+  // Look up extra via 10 -> 8 -> 6 fallback
+  const hsRaw = (v.breakdown.hsCode || '').replace(/\D/g, '');
+  const extra = extraForHs(hsRaw);
+  if (!extra) return v;
+
+  // Use base % if provided, else 0
+  const basePct = v.rate ?? 0;
+  const newPct = basePct + extra;
+
+  // Update components and rate
+  const comps = Array.isArray(v.components) ? [...v.components] : [];
+  comps.push({ kind: 'pct', value: extra });
+  v.components = comps;
+  v.rate = newPct;
+
+  // Recompute duty using the updated % (even if base was 0 / 'Free')
+  v.duty = recomputeDutyFrom(v, newPct);
+
+  // Add a note
   const notes = Array.isArray(v.notes) ? [...v.notes] : [];
   notes.push(`Additional Section 301 duty applied for origin China: ${(extra * 100).toFixed(1)}%.`);
   v.notes = notes;
@@ -367,6 +427,44 @@ async function estimateWithEightToTenFallback(code: string, basePayload: Record<
     }
   }
   return { raw, code };
+}
+
+/* ---------------------------------------------------
+   Fallback: enrich view using /api/hs/search
+----------------------------------------------------*/
+async function enrichFromHsSearch(
+  view: ViewModel,
+  usedCode: string,
+  prefilledDesc?: string,
+): Promise<ViewModel> {
+  const q = (usedCode || '').replace(/\D/g, '');
+  if (!q || q.length < 6) return view;
+
+  try {
+    const r = await fetch(`/api/hs/search?q=${encodeURIComponent(q)}`, { cache: 'no-store' });
+    if (!r.ok) return view;
+    const j = await r.json();
+    const hit = Array.isArray(j.hits) && j.hits.length ? j.hits[0] : null;
+    if (!hit) return view;
+
+    const pct = typeof hit.mfn_advalorem === 'number' ? hit.mfn_advalorem / 100 : null;
+
+    const v: ViewModel = JSON.parse(JSON.stringify(view));
+    v.breakdown.hsCode = hit.code.replace(/\D/g, '').slice(0, 10);
+    v.breakdown.hsCodeFormatted = hit.code;
+    if (!v.breakdown.description)
+      v.breakdown.description = hit.description || prefilledDesc || undefined;
+    v.rate = pct;
+    v.rateType = pct != null ? 'advalorem' : null;
+    v.components = pct != null ? [{ kind: 'pct', value: pct }] : [];
+    if (v.resolution === 'none') v.resolution = 'hts';
+
+    v.duty = pct != null ? recomputeDutyFrom(v, pct) : null;
+
+    return v;
+  } catch {
+    return view;
+  }
 }
 
 /* -----------------------
@@ -439,7 +537,7 @@ function EstimateClient() {
     !loading &&
     !autoUpdating;
 
-  // Focus price ONLY when arriving with prefilled HS from landing/manual
+  // Focus price when arriving prefilled
   useEffect(() => {
     if (focusedFromPrefill.current) return;
     const cameFromPrefill = preHs && (preSource === 'landing' || preSource === 'manual');
@@ -462,7 +560,7 @@ function EstimateClient() {
     if (weightKg !== '') localStorage.setItem('est_weight', String(weightNum));
   }, [countryCode, price, priceNum, qty, qtyNum, weightKg, weightNum]);
 
-  // shareable URL — only set ?hs= when HS is valid
+  // shareable URL
   useEffect(() => {
     const params = new URLSearchParams();
     if (hsValid) params.set('hs', hsDigits);
@@ -515,7 +613,11 @@ function EstimateClient() {
         normalized.breakdown.description = prefilledDesc;
       }
 
-      // 🟣 Apply China overlay
+      if (normalized.rate == null || normalized.resolution === 'none') {
+        normalized = await enrichFromHsSearch(normalized, code, prefilledDesc || undefined);
+      }
+
+      normalized = applyOverrides(normalized, countryCode);
       normalized = applyChinaOverlay(normalized);
 
       setView(normalized);
@@ -532,7 +634,7 @@ function EstimateClient() {
   }
 
   /* -----------------------
-     Auto-rerun (qty/weight/price)
+     Auto-rerun
   ------------------------*/
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
@@ -573,7 +675,11 @@ function EstimateClient() {
           normalized.breakdown.description = prefilledDesc;
         }
 
-        // 🟣 Apply overlay on every recompute
+        if (normalized.rate == null || normalized.resolution === 'none') {
+          normalized = await enrichFromHsSearch(normalized, usedCode, prefilledDesc || undefined);
+        }
+
+        normalized = applyOverrides(normalized, countryCode);
         normalized = applyChinaOverlay(normalized);
 
         setView(normalized);
@@ -592,7 +698,7 @@ function EstimateClient() {
   }, [qtyNum, weightNum, priceNum, countryCode]);
 
   /* -----------------------
-     Use an alternate HS line
+     Use alternate HS
   ------------------------*/
   async function selectAlternate(hsCode: string) {
     try {
@@ -623,7 +729,11 @@ function EstimateClient() {
         weightKg: weightNum ?? undefined,
       });
 
-      // 🟣 Apply overlay
+      if (normalized.rate == null || normalized.resolution === 'none') {
+        normalized = await enrichFromHsSearch(normalized, usedCode);
+      }
+
+      normalized = applyOverrides(normalized, countryCode);
       normalized = applyChinaOverlay(normalized);
 
       setView(normalized);
@@ -848,15 +958,13 @@ function EstimateClient() {
                   {currency.format(
                     (view.breakdown.price ?? 0) *
                       (Number(view.breakdown.qty) > 0 ? Number(view.breakdown.qty) : 1),
-                  )}
+                  )}{' '}
                   <span className="text-gray-500">
-                    {' '}
                     ({currency.format(view.breakdown.price ?? 0)} × {view.breakdown.qty})
                   </span>
                 </div>
               )}
 
-              {/* Rate + Source */}
               <div className="flex items-center">
                 <span>Duty rate: {rateToText(view.rate)}</span>
                 <SourcePill source={sourceFromResolution(view.resolution)} />
@@ -881,7 +989,6 @@ function EstimateClient() {
                 )}
               </div>
 
-              {/* Helpful message when no rate found */}
               {view.rate == null && (
                 <div className="mt-3 rounded-lg bg-amber-50 p-3 text-amber-900 text-sm">
                   No duty rate found for this HS. Double-check the HS (6–10 digits) or try a nearby
@@ -899,7 +1006,6 @@ function EstimateClient() {
                 </div>
               )}
 
-              {/* Alternates */}
               {view.alternates && view.alternates.length > 0 && (
                 <div className="mt-4 rounded-lg border p-3 print:hidden">
                   <div className="font-medium mb-2">Other close HTS lines</div>
@@ -937,7 +1043,6 @@ function EstimateClient() {
           </div>
         )}
 
-        {/* Trust & timestamp footer */}
         <div className="mt-6 text-xs text-gray-500 text-center print:mt-2">
           Rates via USITC HTS API. Calculated{' '}
           <span suppressHydrationWarning>{calcTime || '—'}</span>.

@@ -35,7 +35,7 @@ function IconRobot(props: React.SVGProps<SVGSVGElement>) {
 
 /* Types */
 type Suggestion = {
-  code: string;
+  code: string; // pretty (may contain dots/spaces)
   description: string;
   confidence: number;
   reason?: string;
@@ -49,7 +49,7 @@ async function fetchSuggestions(query: string): Promise<Suggestion[]> {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = await res.json();
 
-  // IMPORTANT: our API returns { hits: [...] }
+  // API returns { hits: [...] }
   const hits = Array.isArray(json.hits) ? json.hits : [];
   return hits.map((h: any) => ({
     code: h.code,
@@ -86,9 +86,13 @@ export default function HomePage() {
     }
   };
 
+  // ✅ Pass digits-only HS to estimator (keep pretty code for display)
   const selectCode = (s: Suggestion) => {
+    const hsDigits = s.code.replace(/\D/g, '').slice(0, 10);
+    if (!hsDigits || hsDigits.length < 6) return;
     const params = new URLSearchParams();
-    params.set('hs', s.code);
+    params.set('hs', hsDigits); // what estimator uses for duty lookup
+    params.set('hs_display', s.code); // pretty version for UI
     params.set('desc', s.description);
     params.set('source', 'landing');
     router.push(`/estimate?${params.toString()}`);
