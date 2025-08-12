@@ -6,6 +6,12 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import CountrySelect from '@/components/CountrySelect';
 import { findCountryByCode } from '@/lib/countries';
 
+// --- debug helper (toggle on/off) ---
+const DEBUG = false;
+const dbg = (...args: any[]) => {
+  if (DEBUG && typeof window !== 'undefined') console.debug('[est]', ...args);
+};
+
 /* --------------------------------
    Page wrapper (Suspense required)
 ----------------------------------*/
@@ -128,6 +134,25 @@ const componentsText = (components?: RateComponent[]) =>
     : components
         .map((c) => (c.kind === 'pct' ? `${(c.value * 100).toFixed(2)}%` : `$${c.value}/${c.per}`))
         .join(' + ');
+
+/* ---------- Friendly messaging helpers ---------- */
+function prettifyNote(n: string): string {
+  return n.replace(
+    /^No HTS or dictionary match found\./i,
+    'We couldn’t find a plain-English description for this exact line. The estimate still reflects your HS code and origin; program duties may still apply.',
+  );
+}
+function showDescMissingInfo(view: ViewModel) {
+  return (
+    view.rate != null &&
+    (!view.breakdown.description || String(view.breakdown.description).trim() === '')
+  );
+}
+// Hide scary “no match” note when a rate exists
+const NO_MATCH_RE = /^No HTS or dictionary match found\./i;
+function shouldHideNoMatchNote(view: ViewModel, note: string): boolean {
+  return view.rate != null && NO_MATCH_RE.test(note);
+}
 
 /* -----------------------------------
    Toast + SourcePill
@@ -309,22 +334,18 @@ function applyOverrides(viewIn: ViewModel, originAlpha2: string | null | undefin
 /* -----------------------
    China overlay (Section 301 demo)
 ------------------------*/
-// demo list; add more as you wish (supports 6, 8, 10 digits)
+
+// Keep just the family roots you care about.
+// Anything more specific (8 or 10 digits) will still match via fallback.
 const CHINA_EXTRAS: Record<string, number> = {
-  // Laptops
+  // Laptops (8471.30)
   '847130': 0.25,
-  '84713000': 0.25,
-  '8471300000': 0.25,
 
-  // Handbags (leather) – use the 4202.22 family to match 4202.22.1500
+  // Handbags (leather) — 4202.22 family
   '420222': 0.075,
-  '42022200': 0.075,
-  '4202221500': 0.075,
 
-  // Sports footwear w/ plastic/rubber soles
+  // Sports footwear w/ plastic/rubber soles — 6404.11 family
   '640411': 0.25,
-  '64041100': 0.25,
-  '6404110000': 0.25,
 };
 
 /** Country check (accepts code 'CN' or name containing 'china') */
@@ -335,11 +356,22 @@ function isChina(code?: string | null, name?: string | null) {
   return cc === 'CN' || nn.includes('china');
 }
 
-/** Find the best extra rate for an HS code by trying 10 -> 8 -> 6 digits */
+/** Find the best extra rate for an HS code by trying 10 → 8 → 6 digits */
 function extraForHs(hs?: string | null): number {
   const d = (hs || '').replace(/\D/g, '');
   if (!d) return 0;
-  return CHINA_EXTRAS[d] ?? CHINA_EXTRAS[d.slice(0, 8)] ?? CHINA_EXTRAS[d.slice(0, 6)] ?? 0;
+
+  // Try exact (10), then 8, then 6
+  const c10 = CHINA_EXTRAS[d];
+  if (typeof c10 === 'number') return c10;
+
+  const c8 = CHINA_EXTRAS[d.slice(0, 8)];
+  if (typeof c8 === 'number') return c8;
+
+  const c6 = CHINA_EXTRAS[d.slice(0, 6)];
+  if (typeof c6 === 'number') return c6;
+
+  return 0;
 }
 
 /** Recompute duty from view, given a percentage rate */
@@ -354,7 +386,6 @@ function recomputeDutyFrom(view: ViewModel, rate: number | null): number | null 
       : 1;
   return price * qty * rate;
 }
-
 /** Mutates a clone of the view to add China overlay when applicable */
 function applyChinaOverlay(viewIn: ViewModel): ViewModel {
   const v: ViewModel = JSON.parse(JSON.stringify(viewIn)); // deep-ish clone
@@ -363,7 +394,7 @@ function applyChinaOverlay(viewIn: ViewModel): ViewModel {
   const originIsChina = isChina((v.breakdown.country || '').slice(0, 2), v.breakdown.country || '');
   if (!originIsChina) return v;
 
-  // Look up extra via 10 -> 8 -> 6 fallback
+  // Look up extra via 10 → 8 → 6 fallback
   const hsRaw = (v.breakdown.hsCode || '').replace(/\D/g, '');
   const extra = extraForHs(hsRaw);
   if (!extra) return v;
@@ -378,7 +409,7 @@ function applyChinaOverlay(viewIn: ViewModel): ViewModel {
   v.components = comps;
   v.rate = newPct;
 
-  // Recompute duty using the updated % (even if base was 0 / 'Free')
+  // Recompute duty using the updated %
   v.duty = recomputeDutyFrom(v, newPct);
 
   // Add a note
@@ -413,17 +444,20 @@ async function callEstimate(payload: Record<string, unknown>) {
 async function estimateWithEightToTenFallback(code: string, basePayload: Record<string, unknown>) {
   const run = (hs: string) => callEstimate({ ...basePayload, query: hs, input: hs, product: hs });
 
+  dbg('api/estimate->start', { code });
   let raw = await run(code);
+  dbg('api/estimate->first', { code, raw });
 
   if (code.length === 8 && isDetailed(raw) && raw.resolution === 'none') {
     const padded = `${code}00`;
     try {
       const raw2 = await run(padded);
+      dbg('api/estimate->padded', { padded, raw2 });
       if (!isDetailed(raw2) || raw2.resolution !== 'none') {
         return { raw: raw2, code: padded };
       }
-    } catch {
-      /* ignore */
+    } catch (e) {
+      dbg('api/estimate->padded-error', e);
     }
   }
   return { raw, code };
@@ -439,6 +473,7 @@ async function enrichFromHsSearch(
 ): Promise<ViewModel> {
   const q = (usedCode || '').replace(/\D/g, '');
   if (!q || q.length < 6) return view;
+  dbg('hs/search->query', { q });
 
   try {
     const r = await fetch(`/api/hs/search?q=${encodeURIComponent(q)}`, { cache: 'no-store' });
@@ -448,6 +483,12 @@ async function enrichFromHsSearch(
     if (!hit) return view;
 
     const pct = typeof hit.mfn_advalorem === 'number' ? hit.mfn_advalorem / 100 : null;
+    dbg('hs/search->hit', {
+      code: hit?.code,
+      desc: hit?.description,
+      mfn_advalorem: hit?.mfn_advalorem,
+      pct,
+    });
 
     const v: ViewModel = JSON.parse(JSON.stringify(view));
     v.breakdown.hsCode = hit.code.replace(/\D/g, '').slice(0, 10);
@@ -462,7 +503,8 @@ async function enrichFromHsSearch(
     v.duty = pct != null ? recomputeDutyFrom(v, pct) : null;
 
     return v;
-  } catch {
+  } catch (e) {
+    dbg('hs/search->error', e);
     return view;
   }
 }
@@ -598,7 +640,17 @@ function EstimateClient() {
       };
 
       let code = hsDigits;
+      dbg('submit->start', {
+        hsDigits: code,
+        countryCode,
+        countryName,
+        priceNum,
+        qtyNum,
+        weightNum,
+      });
+
       let { raw, code: usedCode } = await estimateWithEightToTenFallback(code, basePayload);
+      dbg('submit->api/estimate', { usedCode, raw });
       code = usedCode;
 
       let normalized = normalizeResult(raw, {
@@ -608,6 +660,13 @@ function EstimateClient() {
         qty: qtyNum,
         weightKg: weightNum ?? undefined,
       });
+      dbg('submit->normalized', {
+        hs: normalized.breakdown.hsCode,
+        country: normalized.breakdown.country,
+        rate: normalized.rate,
+        resolution: normalized.resolution,
+        components: normalized.components,
+      });
 
       if (prefilledDesc && !normalized.breakdown.description) {
         normalized.breakdown.description = prefilledDesc;
@@ -616,9 +675,22 @@ function EstimateClient() {
       if (normalized.rate == null || normalized.resolution === 'none') {
         normalized = await enrichFromHsSearch(normalized, code, prefilledDesc || undefined);
       }
+      dbg('submit->after-enrich', {
+        hs: normalized.breakdown.hsCode,
+        rate: normalized.rate,
+        resolution: normalized.resolution,
+      });
 
       normalized = applyOverrides(normalized, countryCode);
       normalized = applyChinaOverlay(normalized);
+      dbg('submit->after-overrides+overlay', {
+        hs: normalized.breakdown.hsCode,
+        rate: normalized.rate,
+        components: normalized.components,
+        duty: normalized.duty,
+        resolution: normalized.resolution,
+        country: normalized.breakdown.country,
+      });
 
       setView(normalized);
       setCalcTime(new Date().toLocaleString());
@@ -662,6 +734,7 @@ function EstimateClient() {
           startCode,
           basePayload,
         );
+        dbg('auto->api/estimate', { usedCode, raw });
 
         let normalized = normalizeResult(raw, {
           product: usedCode,
@@ -669,6 +742,11 @@ function EstimateClient() {
           unitPrice: priceNum,
           qty: qtyNum,
           weightKg: weightNum ?? undefined,
+        });
+        dbg('auto->normalized', {
+          hs: normalized.breakdown.hsCode,
+          rate: normalized.rate,
+          resolution: normalized.resolution,
         });
 
         if (prefilledDesc && !normalized.breakdown.description) {
@@ -678,9 +756,20 @@ function EstimateClient() {
         if (normalized.rate == null || normalized.resolution === 'none') {
           normalized = await enrichFromHsSearch(normalized, usedCode, prefilledDesc || undefined);
         }
+        dbg('auto->after-enrich', {
+          hs: normalized.breakdown.hsCode,
+          rate: normalized.rate,
+          resolution: normalized.resolution,
+        });
 
         normalized = applyOverrides(normalized, countryCode);
         normalized = applyChinaOverlay(normalized);
+        dbg('auto->after-overrides+overlay', {
+          hs: normalized.breakdown.hsCode,
+          rate: normalized.rate,
+          components: normalized.components,
+          duty: normalized.duty,
+        });
 
         setView(normalized);
         setCalcTime(new Date().toLocaleString());
@@ -720,6 +809,7 @@ function EstimateClient() {
 
       const code = sanitizeHS(hsCode);
       const { raw, code: usedCode } = await estimateWithEightToTenFallback(code, basePayload);
+      dbg('alt->api/estimate', { usedCode, raw });
 
       let normalized = normalizeResult(raw, {
         product: usedCode,
@@ -732,9 +822,19 @@ function EstimateClient() {
       if (normalized.rate == null || normalized.resolution === 'none') {
         normalized = await enrichFromHsSearch(normalized, usedCode);
       }
+      dbg('alt->after-enrich', {
+        hs: normalized.breakdown.hsCode,
+        rate: normalized.rate,
+        resolution: normalized.resolution,
+      });
 
       normalized = applyOverrides(normalized, countryCode);
       normalized = applyChinaOverlay(normalized);
+      dbg('alt->after-overrides+overlay', {
+        hs: normalized.breakdown.hsCode,
+        rate: normalized.rate,
+        duty: normalized.duty,
+      });
 
       setView(normalized);
       setCalcTime(new Date().toLocaleString());
@@ -989,22 +1089,34 @@ function EstimateClient() {
                 )}
               </div>
 
-              {view.rate == null && (
+              {view.rate == null ? (
                 <div className="mt-3 rounded-lg bg-amber-50 p-3 text-amber-900 text-sm">
-                  No duty rate found for this HS. Double-check the HS (6–10 digits) or try a nearby
-                  HS using HS Lookup.
+                  We couldn’t find an MFN rate for this HS line. Double-check the HS (6–10 digits),
+                  or try a nearby line using HS Lookup. The calculator still shows your inputs for
+                  reference.
                 </div>
-              )}
+              ) : showDescMissingInfo(view) ? (
+                <div className="mt-3 rounded-lg bg-slate-50 p-3 text-slate-700 text-sm">
+                  We used your HS code directly. A description wasn’t available in our quick lookup,
+                  but the duty rate shown reflects your HS code and origin.
+                </div>
+              ) : null}
 
-              {Array.isArray(view.notes) && view.notes.length > 0 && (
-                <div className="mt-3 rounded-lg bg-amber-50 p-3 text-amber-900 text-sm">
-                  <ul className="list-disc pl-5 space-y-1">
-                    {view.notes.map((n, i) => (
-                      <li key={i}>{n}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
+              {Array.isArray(view.notes) &&
+                view.notes.length > 0 &&
+                (() => {
+                  const safeNotes = view.notes.filter((n) => !shouldHideNoMatchNote(view, n));
+                  if (safeNotes.length === 0) return null;
+                  return (
+                    <div className="mt-3 rounded-lg bg-amber-50 p-3 text-amber-900 text-sm">
+                      <ul className="list-disc pl-5 space-y-1">
+                        {safeNotes.map((n, i) => (
+                          <li key={i}>{prettifyNote(n)}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  );
+                })()}
 
               {view.alternates && view.alternates.length > 0 && (
                 <div className="mt-4 rounded-lg border p-3 print:hidden">
