@@ -5,6 +5,7 @@ import React, { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import CountrySelect from '@/components/CountrySelect';
 import { findCountryByCode } from '@/lib/countries';
+import { logEvent } from '@/lib/analytics'; // 🔹 tracking
 
 // --- debug helper (toggle on/off) ---
 const DEBUG = false;
@@ -19,7 +20,7 @@ export default function EstimatePage() {
   return (
     <Suspense
       fallback={
-        <div className="min-h-screen bg-indigo-50 flex items-center justify-center px-6">
+        <div className="min-h-[100svh] bg-indigo-50 flex items-center justify-center px-6">
           <div className="max-w-xl w-full bg-white p-6 rounded-2xl shadow ring-1 ring-black/5 text-sm text-gray-600">
             Loading estimator…
           </div>
@@ -148,7 +149,6 @@ function showDescMissingInfo(view: ViewModel) {
     (!view.breakdown.description || String(view.breakdown.description).trim() === '')
   );
 }
-// Hide scary “no match” note when a rate exists
 const NO_MATCH_RE = /^No HTS or dictionary match found\./i;
 function shouldHideNoMatchNote(view: ViewModel, note: string): boolean {
   return view.rate != null && NO_MATCH_RE.test(note);
@@ -334,21 +334,12 @@ function applyOverrides(viewIn: ViewModel, originAlpha2: string | null | undefin
 /* -----------------------
    China overlay (Section 301 demo)
 ------------------------*/
-
-// Keep just the family roots you care about.
-// Anything more specific (8 or 10 digits) will still match via fallback.
 const CHINA_EXTRAS: Record<string, number> = {
-  // Laptops (8471.30)
   '847130': 0.25,
-
-  // Handbags (leather) — 4202.22 family
   '420222': 0.075,
-
-  // Sports footwear w/ plastic/rubber soles — 6404.11 family
   '640411': 0.25,
 };
 
-/** Country check (accepts code 'CN' or name containing 'china') */
 function isChina(code?: string | null, name?: string | null) {
   if (!code && !name) return false;
   const cc = (code || '').trim().toUpperCase();
@@ -356,25 +347,18 @@ function isChina(code?: string | null, name?: string | null) {
   return cc === 'CN' || nn.includes('china');
 }
 
-/** Find the best extra rate for an HS code by trying 10 → 8 → 6 digits */
 function extraForHs(hs?: string | null): number {
   const d = (hs || '').replace(/\D/g, '');
   if (!d) return 0;
-
-  // Try exact (10), then 8, then 6
   const c10 = CHINA_EXTRAS[d];
   if (typeof c10 === 'number') return c10;
-
   const c8 = CHINA_EXTRAS[d.slice(0, 8)];
   if (typeof c8 === 'number') return c8;
-
   const c6 = CHINA_EXTRAS[d.slice(0, 6)];
   if (typeof c6 === 'number') return c6;
-
   return 0;
 }
 
-/** Recompute duty from view, given a percentage rate */
 function recomputeDutyFrom(view: ViewModel, rate: number | null): number | null {
   if (rate == null) return null;
   const price = Number(view.breakdown.price ?? 0);
@@ -386,33 +370,23 @@ function recomputeDutyFrom(view: ViewModel, rate: number | null): number | null 
       : 1;
   return price * qty * rate;
 }
-/** Mutates a clone of the view to add China overlay when applicable */
 function applyChinaOverlay(viewIn: ViewModel): ViewModel {
-  const v: ViewModel = JSON.parse(JSON.stringify(viewIn)); // deep-ish clone
-
-  // Only apply when origin is China
+  const v: ViewModel = JSON.parse(JSON.stringify(viewIn));
   const originIsChina = isChina((v.breakdown.country || '').slice(0, 2), v.breakdown.country || '');
   if (!originIsChina) return v;
 
-  // Look up extra via 10 → 8 → 6 fallback
   const hsRaw = (v.breakdown.hsCode || '').replace(/\D/g, '');
   const extra = extraForHs(hsRaw);
   if (!extra) return v;
 
-  // Use base % if provided, else 0
   const basePct = v.rate ?? 0;
   const newPct = basePct + extra;
-
-  // Update components and rate
   const comps = Array.isArray(v.components) ? [...v.components] : [];
   comps.push({ kind: 'pct', value: extra });
   v.components = comps;
   v.rate = newPct;
-
-  // Recompute duty using the updated %
   v.duty = recomputeDutyFrom(v, newPct);
 
-  // Add a note
   const notes = Array.isArray(v.notes) ? [...v.notes] : [];
   notes.push(`Additional Section 301 duty applied for origin China: ${(extra * 100).toFixed(1)}%.`);
   v.notes = notes;
@@ -578,6 +552,31 @@ function EstimateClient() {
     priceNum >= 0 &&
     !loading &&
     !autoUpdating;
+
+  // 🔹 FIRE estimator_loaded once (if a code is present on entry)
+  useEffect(() => {
+    const initial = (preHs || '').replace(/\D/g, '').slice(0, 10);
+    if (initial && initial.length >= 6) {
+      logEvent({
+        event_type: 'estimator_loaded',
+        estimator_loaded: true,
+        clicked_code: initial,
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Track HS changes (avoid spamming by keeping last sent)
+  const lastReportedHs = useRef<string>((preHs || '').replace(/\D/g, '').slice(0, 10));
+  const handleHsChange = (next: string) => {
+    setHsInput(next);
+    if (preHs) setPrefilledDesc('');
+    const sanitized = sanitizeHS(next);
+    if (isValidHS(next) && sanitized !== lastReportedHs.current) {
+      lastReportedHs.current = sanitized;
+      logEvent({ event_type: 'code_changed', code_changed: true, clicked_code: sanitized });
+    }
+  };
 
   // Focus price when arriving prefilled
   useEffect(() => {
@@ -842,6 +841,13 @@ function EstimateClient() {
       params.set('hs', usedCode);
       router.replace(`/estimate?${params}`, { scroll: false });
       setToast({ kind: 'success', msg: `Using ${formatHsCode(usedCode)}` });
+
+      // 🔹 Treat alternate selection as a code change
+      const sanitized = usedCode.replace(/\D/g, '').slice(0, 10);
+      if (sanitized && sanitized !== lastReportedHs.current) {
+        lastReportedHs.current = sanitized;
+        logEvent({ event_type: 'code_changed', code_changed: true, clicked_code: sanitized });
+      }
     } catch (e: unknown) {
       setToast({ kind: 'error', msg: e instanceof Error ? e.message : 'Failed to use alternate' });
     } finally {
@@ -862,7 +868,7 @@ function EstimateClient() {
   const handlePrint = () => window.print();
 
   return (
-    <main className="relative min-h-screen bg-indigo-50 flex items-center justify-center px-6">
+    <main className="relative min-h-[100svh] bg-indigo-50 flex items-center justify-center px-6">
       <div className="relative z-10 max-w-xl w-full bg-white p-8 rounded-2xl shadow-xl ring-1 ring-black/5 print:shadow-none print:max-w-none print:w-full print:p-0">
         <h1 className="text-2xl font-bold text-gray-900 mb-6 print:mb-3">Duty Estimator</h1>
 
@@ -884,11 +890,8 @@ function EstimateClient() {
               type="text"
               placeholder="Enter a 6, 8, or 10-digit HS code"
               value={hsInput}
-              onChange={(e) => {
-                setHsInput(e.target.value);
-                if (preHs) setPrefilledDesc('');
-              }}
-              className={`mt-1 w-full rounded-lg border px-4 py-2 focus:outline-none focus:ring-2 ${
+              onChange={(e) => handleHsChange(e.target.value)} // 🔹 track code_changed
+              className={`mt-1 w-full rounded-lg border px-4 py-2 text-[16px] focus:outline-none focus:ring-2 ${
                 hsInput.length === 0 || hsValid
                   ? 'border-gray-300 focus:ring-blue-500'
                   : 'border-red-300 focus:ring-red-500'
@@ -924,7 +927,7 @@ function EstimateClient() {
                 placeholder="e.g., 49.99"
                 value={price}
                 onChange={(e) => setPrice(e.target.value)}
-                className="w-full rounded-r-lg border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="w-full rounded-r-lg border border-gray-300 px-4 py-2 text-[16px] focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
             </div>
           </div>
@@ -932,7 +935,13 @@ function EstimateClient() {
           {/* Country */}
           <CountrySelect
             value={countryCode || null}
-            onChange={(code) => setCountryCode(code ?? '')}
+            onChange={(code) => {
+              setCountryCode(code ?? '');
+              if (code) {
+                // 🔹 track origin_selected
+                logEvent({ event_type: 'origin_selected', origin_country: code });
+              }
+            }}
             frequentlyUsed={['CN', 'CA', 'MX', 'JP', 'VN']}
             placeholder="Select a country…"
           />
@@ -952,7 +961,7 @@ function EstimateClient() {
                 placeholder="optional"
                 value={qty}
                 onChange={(e) => setQty(e.target.value)}
-                className="mt-1 w-full rounded-lg border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="mt-1 w-full rounded-lg border border-gray-300 px-4 py-2 text-[16px] focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
             </div>
             <div>
@@ -968,7 +977,7 @@ function EstimateClient() {
                 placeholder="optional"
                 value={weightKg}
                 onChange={(e) => setWeightKg(e.target.value)}
-                className="mt-1 w-full rounded-lg border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="mt-1 w-full rounded-lg border border-gray-300 px-4 py-2 text-[16px] focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
             </div>
           </div>
@@ -1101,22 +1110,6 @@ function EstimateClient() {
                   but the duty rate shown reflects your HS code and origin.
                 </div>
               ) : null}
-
-              {Array.isArray(view.notes) &&
-                view.notes.length > 0 &&
-                (() => {
-                  const safeNotes = view.notes.filter((n) => !shouldHideNoMatchNote(view, n));
-                  if (safeNotes.length === 0) return null;
-                  return (
-                    <div className="mt-3 rounded-lg bg-amber-50 p-3 text-amber-900 text-sm">
-                      <ul className="list-disc pl-5 space-y-1">
-                        {safeNotes.map((n, i) => (
-                          <li key={i}>{prettifyNote(n)}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  );
-                })()}
 
               {view.alternates && view.alternates.length > 0 && (
                 <div className="mt-4 rounded-lg border p-3 print:hidden">

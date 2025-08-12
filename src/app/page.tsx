@@ -4,6 +4,7 @@
 import { useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
+import { logEvent } from '@/lib/analytics';
 
 /* Icons */
 function IconCalc(props: React.SVGProps<SVGSVGElement>) {
@@ -42,14 +43,25 @@ type Suggestion = {
   mfn_advalorem?: number | null;
 };
 
+/* Choose 1–3 best suggestions */
+function selectTopSuggestions(hits: Suggestion[]): Suggestion[] {
+  const sorted = [...hits].sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
+  if (sorted.length === 0) return [];
+  const top = sorted[0];
+  const second = sorted[1];
+  if ((top.confidence ?? 0) >= 0.8) return [top];
+  if (second && top.confidence! - second.confidence! < 0.08 && second.confidence! >= 0.55) {
+    return sorted.slice(0, 3);
+  }
+  return sorted.slice(0, 2);
+}
+
 /* API call -> suggestions */
 async function fetchSuggestions(query: string): Promise<Suggestion[]> {
   if (!query.trim()) return [];
   const res = await fetch(`/api/hs/search?q=${encodeURIComponent(query)}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = await res.json();
-
-  // API returns { hits: [...] }
   const hits = Array.isArray(json.hits) ? json.hits : [];
   return hits.map((h: any) => ({
     code: h.code,
@@ -75,24 +87,51 @@ export default function HomePage() {
     setLoading(true);
     setError(null);
     setSuggestions(null);
+    const rawTerm = query;
+    const normalized = query.trim().toLowerCase();
+
     try {
-      const res = await fetchSuggestions(query);
-      setSuggestions(res ?? []);
+      const allHits = await fetchSuggestions(rawTerm);
+      const selected = selectTopSuggestions(allHits);
+      setSuggestions(selected ?? []);
+
+      // Track search with what we showed
+      await logEvent({
+        event_type: 'search_performed',
+        search_term: rawTerm,
+        normalized_term: normalized,
+        suggested_codes: (selected ?? []).map((s) => ({
+          code: s.code,
+          confidence: s.confidence ?? 0,
+          label: s.description,
+        })),
+      });
     } catch (e: any) {
       setError(e?.message || 'Something went wrong. Try a simpler description.');
       setSuggestions([]);
+      await logEvent({
+        event_type: 'search_performed',
+        search_term: rawTerm,
+        normalized_term: normalized,
+        suggested_codes: [],
+      });
     } finally {
       setLoading(false);
     }
   };
 
-  // ✅ Pass digits-only HS to estimator (keep pretty code for display)
-  const selectCode = (s: Suggestion) => {
+  // Pass digits-only HS to estimator (keep pretty code for display)
+  const selectCode = async (s: Suggestion) => {
+    await logEvent({
+      event_type: 'result_clicked',
+      clicked_code: s.code.replace(/\D/g, '').slice(0, 10),
+    });
+
     const hsDigits = s.code.replace(/\D/g, '').slice(0, 10);
     if (!hsDigits || hsDigits.length < 6) return;
     const params = new URLSearchParams();
-    params.set('hs', hsDigits); // what estimator uses for duty lookup
-    params.set('hs_display', s.code); // pretty version for UI
+    params.set('hs', hsDigits);
+    params.set('hs_display', s.code);
     params.set('desc', s.description);
     params.set('source', 'landing');
     router.push(`/estimate?${params.toString()}`);
@@ -108,7 +147,7 @@ export default function HomePage() {
   };
 
   return (
-    <main className="min-h-screen bg-white">
+    <main className="min-h-[100svh] bg-white">
       {/* HERO */}
       <section className="relative bg-indigo-200">
         <div className="mx-auto max-w-6xl px-6 py-16 text-center">
@@ -136,8 +175,8 @@ export default function HomePage() {
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && !heroCtaDisabled) handleFindHs();
                   }}
-                  placeholder='e.g. "leather handbags" or 900410'
-                  className="flex-1 bg-transparent text-sm outline-none placeholder:text-slate-400"
+                  placeholder='e.g. "leather handbags"'
+                  className="flex-1 bg-transparent text-[16px] md:text-sm outline-none placeholder:text-slate-400"
                 />
                 <button
                   onClick={handleFindHs}
@@ -155,7 +194,7 @@ export default function HomePage() {
                   <ul className="space-y-2">
                     {suggestions.map((s) => (
                       <li
-                        key={s.code}
+                        key={`${s.code}-${s.confidence}`}
                         className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 hover:bg-indigo-50"
                       >
                         <div className="min-w-0">
@@ -169,7 +208,7 @@ export default function HomePage() {
                           </div>
                           <div className="truncate text-xs text-slate-600">{s.description}</div>
                           {typeof s.mfn_advalorem === 'number' && (
-                            <div className="text-[11px] text-slate-500 mt-0.5">
+                            <div className="mt-0.5 text-[11px] text-slate-500">
                               Duty: {s.mfn_advalorem}% (MFN)
                             </div>
                           )}
@@ -197,7 +236,7 @@ export default function HomePage() {
                       code manually.
                     </div>
 
-                    <div className="rounded-xl border border-slate-200 bg-white p-3">
+                    <div className="rounded-2xl border border-slate-200 bg-white p-3">
                       {!manualOpen ? (
                         <button
                           onClick={() => setManualOpen(true)}
@@ -211,7 +250,7 @@ export default function HomePage() {
                             value={manualHs}
                             onChange={(e) => setManualHs(e.target.value)}
                             placeholder="Enter HS code (6–10 digits)"
-                            className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none"
+                            className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-[16px] md:text-sm outline-none"
                           />
                           <button
                             onClick={goManual}
@@ -223,6 +262,11 @@ export default function HomePage() {
                         </div>
                       )}
                     </div>
+
+                    <p className="text-[11px] text-slate-500">
+                      We show up to 3 likely codes with confidence. If one is very strong, we pick
+                      just that to keep things fast.
+                    </p>
                   </div>
                 )}
               </div>
