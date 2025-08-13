@@ -36,7 +36,7 @@ function IconRobot(props: React.SVGProps<SVGSVGElement>) {
 
 /* Types */
 type Suggestion = {
-  code: string; // pretty (may contain dots/spaces)
+  code: string;
   description: string;
   confidence: number;
   reason?: string;
@@ -70,6 +70,19 @@ async function fetchSuggestions(query: string): Promise<Suggestion[]> {
     reason: h.reason,
     mfn_advalorem: h.mfn_advalorem ?? null,
   }));
+}
+
+/* Helpers */
+const hsDigitsFrom = (code: string) => (code ?? '').replace(/\D/g, '').slice(0, 10);
+const codeIsValid = (code: string) => {
+  const len = hsDigitsFrom(code).length;
+  return len >= 4 && len <= 10;
+};
+// Pad 4-digit headings to 6 digits for estimator
+function normalizeHsCode(code: string) {
+  let digits = hsDigitsFrom(code);
+  if (digits.length === 4) digits = digits + '00';
+  return digits;
 }
 
 export default function HomePage() {
@@ -119,15 +132,12 @@ export default function HomePage() {
     }
   };
 
-  // Pass digits-only HS to estimator (keep pretty code for display)
+  // Pass digits-only HS to estimator (normalize 4->6)
   const selectCode = async (s: Suggestion) => {
-    await logEvent({
-      event_type: 'result_clicked',
-      clicked_code: s.code.replace(/\D/g, '').slice(0, 10),
-    });
-
-    const hsDigits = s.code.replace(/\D/g, '').slice(0, 10);
+    const hsDigits = normalizeHsCode(s.code);
     if (!hsDigits || hsDigits.length < 6) return;
+    await logEvent({ event_type: 'result_clicked', clicked_code: hsDigits });
+
     const params = new URLSearchParams();
     params.set('hs', hsDigits);
     params.set('hs_display', s.code);
@@ -137,7 +147,7 @@ export default function HomePage() {
   };
 
   const goManual = () => {
-    const hs = manualHs.replace(/\D/g, '').slice(0, 10);
+    const hs = normalizeHsCode(manualHs);
     if (!hs || hs.length < 6) return;
     const params = new URLSearchParams();
     params.set('hs', hs);
@@ -191,40 +201,82 @@ export default function HomePage() {
 
                 {suggestions && suggestions.length > 0 && (
                   <ul className="space-y-2">
-                    {suggestions.map((s) => (
-                      <li
-                        key={`${s.code}-${s.confidence}`}
-                        className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 hover:bg-indigo-50"
-                      >
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-2">
-                            <div className="text-sm font-semibold text-slate-900">{s.code}</div>
-                            {s.reason && (
-                              <span className="text-[10px] uppercase text-slate-500">
-                                {s.reason}
-                              </span>
+                    {suggestions.map((s) => {
+                      const isValid = codeIsValid(s.code);
+                      const activate = () => {
+                        if (!isValid) return;
+                        selectCode(s);
+                      };
+
+                      return (
+                        <li
+                          key={`${s.code}-${s.confidence}`}
+                          className={[
+                            'flex items-center justify-between rounded-xl border border-slate-200 px-3 py-2',
+                            isValid
+                              ? 'bg-slate-50 hover:bg-indigo-50 cursor-pointer'
+                              : 'bg-slate-50 opacity-80',
+                          ].join(' ')}
+                          onClick={activate}
+                          onKeyDown={(e) => {
+                            if ((e.key === 'Enter' || e.key === ' ') && isValid) {
+                              e.preventDefault();
+                              activate();
+                            }
+                          }}
+                          role="button"
+                          tabIndex={0}
+                          aria-disabled={!isValid}
+                        >
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <div className="text-sm font-semibold text-slate-900">{s.code}</div>
+                              {s.reason && (
+                                <span className="text-[10px] uppercase text-slate-500">
+                                  {s.reason}
+                                </span>
+                              )}
+                            </div>
+                            <div className="truncate text-xs text-slate-600">{s.description}</div>
+                            {typeof s.mfn_advalorem === 'number' && (
+                              <div className="mt-0.5 text-[11px] text-slate-500">
+                                Duty: {s.mfn_advalorem}% (MFN)
+                              </div>
+                            )}
+                            {!isValid && (
+                              <div className="mt-1 text-[11px] text-amber-700">
+                                This suggestion doesn’t include a usable HS code yet.
+                              </div>
                             )}
                           </div>
-                          <div className="truncate text-xs text-slate-600">{s.description}</div>
-                          {typeof s.mfn_advalorem === 'number' && (
-                            <div className="mt-0.5 text-[11px] text-slate-500">
-                              Duty: {s.mfn_advalorem}% (MFN)
-                            </div>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <span className="text-[10px] text-slate-500">
-                            {Math.round((s.confidence ?? 0.8) * 100)}% match
-                          </span>
-                          <button
-                            onClick={() => selectCode(s)}
-                            className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-700"
-                          >
-                            Use this code
-                          </button>
-                        </div>
-                      </li>
-                    ))}
+
+                          <div className="flex items-center gap-2">
+                            <span className="text-[10px] text-slate-500">
+                              {Math.round((s.confidence ?? 0.8) * 100)}% match
+                            </span>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                activate();
+                              }}
+                              disabled={!isValid}
+                              title={
+                                isValid ? 'Send to estimator' : 'Needs at least a 4-digit code'
+                              }
+                              className={[
+                                'rounded-lg px-3 py-1.5 text-xs font-medium',
+                                isValid
+                                  ? 'bg-indigo-600 text-white hover:bg-indigo-700'
+                                  : 'bg-slate-200 text-slate-500 cursor-not-allowed',
+                              ].join(' ')}
+                            >
+                              Use this code
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
 
@@ -248,12 +300,12 @@ export default function HomePage() {
                           <input
                             value={manualHs}
                             onChange={(e) => setManualHs(e.target.value)}
-                            placeholder="Enter HS code (6–10 digits)"
+                            placeholder="Enter HS code (4–10 digits)"
                             className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-[16px] md:text-sm outline-none"
                           />
                           <button
                             onClick={goManual}
-                            disabled={manualHs.replace(/\D/g, '').length < 6}
+                            disabled={manualHs.replace(/\D/g, '').length < 4}
                             className="rounded-lg bg-indigo-600 px-3 py-2 text-xs font-medium text-white disabled:opacity-50"
                           >
                             Use code
