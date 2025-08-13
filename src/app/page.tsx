@@ -95,7 +95,6 @@ export default function HomePage() {
       const selected = selectTopSuggestions(allHits);
       setSuggestions(selected ?? []);
 
-      // Track search with what we showed
       await logEvent({
         event_type: 'search_performed',
         search_term: rawTerm,
@@ -331,6 +330,82 @@ export default function HomePage() {
           </div>
         </div>
       </section>
+
+      {/* CTA BAND */}
+      <section className="bg-indigo-600">
+        <div className="mx-auto max-w-6xl px-6 py-10 text-center">
+          <h3 className="text-2xl font-semibold text-white">Ready to estimate your shipment?</h3>
+          <p className="mt-2 text-indigo-100">
+            Start with a likely HS code and get a clear duty breakdown in seconds.
+          </p>
+          <div className="mt-5">
+            <Link
+              href="/estimate"
+              className="inline-block rounded-xl bg-white px-5 py-3 text-indigo-700 font-medium shadow-sm hover:bg-indigo-50"
+            >
+              Open Tariff Estimator
+            </Link>
+          </div>
+        </div>
+      </section>
+
+      {/* FAQ */}
+      <section className="bg-white">
+        <div className="mx-auto max-w-5xl px-6 py-14">
+          <h2 className="text-center text-2xl font-semibold text-slate-900">FAQ</h2>
+          <div className="mt-8 grid gap-6 sm:grid-cols-2">
+            <div className="rounded-2xl border border-slate-200 bg-white p-6">
+              <h4 className="font-semibold text-slate-900">Is this official duty advice?</h4>
+              <p className="mt-2 text-sm text-slate-600">
+                No. Importium gives quick estimates and pointers to official sources. For binding
+                decisions, consult CBP or a licensed customs broker.
+              </p>
+            </div>
+            <div className="rounded-2xl border border-slate-200 bg-white p-6">
+              <h4 className="font-semibold text-slate-900">What if I don’t know my HS code?</h4>
+              <p className="mt-2 text-sm text-slate-600">
+                Use the search box on the homepage. We’ll suggest 1–3 likely codes with confidence,
+                and you can one-tap send it to the estimator.
+              </p>
+            </div>
+            <div className="rounded-2xl border border-slate-200 bg-white p-6">
+              <h4 className="font-semibold text-slate-900">Do you handle Section 301 tariffs?</h4>
+              <p className="mt-2 text-sm text-slate-600">
+                Yes—our estimator flags likely Section 301 duties where applicable and shows the
+                combined rate.
+              </p>
+            </div>
+            <div className="rounded-2xl border border-slate-200 bg-white p-6">
+              <h4 className="font-semibold text-slate-900">Is it free?</h4>
+              <p className="mt-2 text-sm text-slate-600">
+                The core estimator is free to start. Advanced features may become paid later.
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* FOOTER */}
+      <footer className="bg-slate-50">
+        <div className="mx-auto max-w-6xl px-6 py-10">
+          <div className="flex flex-col items-center justify-between gap-4 sm:flex-row">
+            <p className="text-sm text-slate-600">© {new Date().getFullYear()} Importium</p>
+            <nav className="flex items-center gap-4 text-sm text-slate-600">
+              <Link href="/estimate" className="hover:text-slate-900">
+                Estimator
+              </Link>
+              <a
+                href="https://www.usitc.gov/tata/hts/index.htm"
+                target="_blank"
+                rel="noreferrer"
+                className="hover:text-slate-900"
+              >
+                HTSUS
+              </a>
+            </nav>
+          </div>
+        </div>
+      </footer>
     </main>
   );
 }
