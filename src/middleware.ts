@@ -1,37 +1,42 @@
-import { NextResponse, NextRequest } from 'next/server';
+// src/middleware.ts
+import { NextRequest, NextResponse } from 'next/server';
 
-const ADMIN_COOKIE = 'imp_admin';
 const ADMIN_PATH = '/admin';
+const ADMIN_COOKIE = 'is_admin';
 const COOKIE_MAX_DAYS = 30;
+
+const EXPECTED_KEY = process.env.ADMIN_KEY;
 
 export function middleware(req: NextRequest) {
   const { pathname, searchParams } = req.nextUrl;
 
-  // Only guard /admin (and subpaths)
   if (!pathname.startsWith(ADMIN_PATH)) return NextResponse.next();
 
-  // Already authed via cookie?
+  if (!EXPECTED_KEY) {
+    return new NextResponse('Admin disabled: ADMIN_KEY is not configured on this environment.', {
+      status: 503,
+      headers: { 'content-type': 'text/plain' },
+    });
+  }
+
   const hasCookie = req.cookies.get(ADMIN_COOKIE)?.value === '1';
   if (hasCookie) return NextResponse.next();
 
-  // Allow ?key=... once, then set cookie
   const keyParam = searchParams.get('key');
-  const expected = process.env.NEXT_PUBLIC_ADMIN_KEY || process.env.ADMIN_KEY;
-  if (expected && keyParam && keyParam === expected) {
+  if (keyParam && keyParam === EXPECTED_KEY) {
     const res = NextResponse.next();
     res.cookies.set({
       name: ADMIN_COOKIE,
       value: '1',
       httpOnly: true,
       sameSite: 'lax',
-      secure: true,
-      maxAge: COOKIE_MAX_DAYS * 24 * 60 * 60,
+      secure: process.env.NODE_ENV === 'production', // ✅ only secure in prod
       path: '/',
+      maxAge: COOKIE_MAX_DAYS * 24 * 60 * 60,
     });
     return res;
   }
 
-  // Not authed → simple 401 page
   return new NextResponse('Unauthorized. Append ?key=YOUR_KEY once to grant access.', {
     status: 401,
     headers: { 'content-type': 'text/plain' },
