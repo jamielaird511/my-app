@@ -2,7 +2,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 
-export const dynamic = 'force-dynamic'; // avoid static caching
+export const dynamic = 'force-dynamic';
 
 // ---- Supabase (server-only) ----
 const url = (process.env.NEXT_PUBLIC_SUPABASE_URL || '').trim();
@@ -12,15 +12,7 @@ if (!url || !key) {
 }
 const sb = createClient(url, key, { auth: { persistSession: false } });
 
-// ---- Helpers ----
-function norm(s: string) {
-  return (s || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9 ]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
+// ---- Types / helpers ----
 type FullRow = {
   code: string;
   code_len: number | null;
@@ -41,101 +33,145 @@ function shapeHit(row: Partial<FullRow>, confidence: number, reason: string) {
     mfn_specific: row.mfn_specific ?? null,
     rev_number: row.rev_number ?? null,
     rev_date: row.rev_date ?? null,
-    confidence,
+    confidence, // 0..1
     reason,
   };
+}
+
+function isNumericHS(q: string) {
+  const digits = q.replace(/\D/g, '');
+  // accept 4/6/8/10 so dotted inputs resolve (e.g., 6404.00, 6404.00.0000)
+  return [4, 6, 8, 10].includes(digits.length);
 }
 
 export async function GET(req: NextRequest) {
   const urlObj = new URL(req.url);
   const qRaw = (urlObj.searchParams.get('q') || '').trim();
-  const limit = Math.min(parseInt(urlObj.searchParams.get('limit') || '20', 10), 50);
+  const limitReq = parseInt(urlObj.searchParams.get('limit') || '4', 10);
+  const LIMIT = Math.max(1, Math.min(limitReq || 4, 10));
 
   if (!qRaw) {
     return NextResponse.json({ hits: [], q: qRaw, meta: { reason: 'empty query' } });
   }
 
-  try {
-    // 1) PRIMARY: RPC (aliases first, numeric fallbacks) -> enrich from hts_lines
-    let rpcHits: Array<{ hs_code: string; description: string; source?: string; rank?: number }> =
-      [];
-    try {
-      const { data: rpcData, error: rpcErr } = await sb.rpc('search_hs_aliases', {
-        query_text: qRaw, // <-- correct arg name
-        limit_n: limit,
-      });
-      if (rpcErr) {
-        // Log but don't crash; we'll fall back
-        console.error('search_hs_aliases RPC error:', rpcErr);
-      } else if (rpcData && rpcData.length > 0) {
-        rpcHits = rpcData as any[];
-      }
-    } catch (e) {
-      console.error('RPC call threw:', e);
-    }
+  const userDigits = qRaw.replace(/\D/g, '');
+  const numeric = isNumericHS(qRaw);
 
-    if (rpcHits.length > 0) {
-      // Keep order from RPC; dedupe hs_code
-      const seen = new Set<string>();
-      const codes = rpcHits
-        .map((r) => r.hs_code)
-        .filter((c) => {
-          if (!c || seen.has(c)) return false;
-          seen.add(c);
+  try {
+    // 1) PRIMARY: RPC (unified fuzzy + numeric)
+    try {
+      const { data: rpcData, error: rpcErr } = await sb.rpc('hs_search_unified', {
+        p_query: qRaw,
+        p_digits: userDigits,
+        p_is_numeric: numeric,
+        p_limit: LIMIT,
+      });
+
+      if (!rpcErr && rpcData && rpcData.length > 0) {
+        const seen = new Set<string>();
+        const ordered = (rpcData as any[]).filter((r) => {
+          const code = String(r.hs_code || '');
+          if (!code || seen.has(code)) return false;
+          seen.add(code);
           return true;
         });
 
-      // Enrich from hts_lines by code to keep your existing hit shape
-      const { data: fullRows, error: fullErr } = await sb
-        .from('hts_lines')
-        .select('code,code_len,description,mfn_advalorem,mfn_specific,rev_number,rev_date,hts10')
-        .in('code', codes);
+        const codes = ordered.map((r) => String(r.hs_code));
+        const { data: fullRows } = await sb
+          .from('hts_lines')
+          .select('code,code_len,description,mfn_advalorem,mfn_specific,rev_number,rev_date,hts10')
+          .in('code', codes);
 
-      if (fullErr) {
-        console.error('enrich hts_lines error:', fullErr);
-      }
+        const byCode = new Map<string, FullRow>();
+        (fullRows || []).forEach((r) => byCode.set(r.code, r as FullRow));
 
-      const byCode = new Map<string, FullRow>();
-      (fullRows || []).forEach((r) => byCode.set(r.code, r as FullRow));
-
-      const hits = codes.map((code) => {
-        const base =
-          byCode.get(code) ||
-          ({
+        const hits = ordered.map((r: any) => {
+          const code = String(r.hs_code);
+          const base: Partial<FullRow> = byCode.get(code) || {
             code,
-            description: rpcHits.find((h) => h.hs_code === code)?.description ?? '',
-          } as Partial<FullRow>);
-        const r = rpcHits.find((h) => h.hs_code === code);
-        const conf = typeof r?.rank === 'number' ? Math.max(0, Math.min(1, Number(r!.rank))) : 0.8;
-        const reason = r?.source ? `RPC:${r.source}` : 'RPC';
-        return shapeHit(base, conf, reason);
-      });
+            description: r.description ?? '',
+          };
+          const conf = Math.max(0, Math.min(1, Number(r.score ?? 0)));
+          const reason = r.reason ? String(r.reason) : numeric ? 'numeric match' : 'fuzzy match';
+          return shapeHit(base, conf, reason);
+        });
 
-      return NextResponse.json({ hits, q: qRaw });
+        return NextResponse.json({ hits, q: qRaw });
+      }
+    } catch (e) {
+      console.error('hs_search_unified RPC error:', e);
     }
 
-    // 2) FALLBACK: keyword scan via standardized view -> enrich from hts_lines
-    //    (std view guarantees hs_code column)
-    const { data: kwStd, error: kwStdErr } = await sb
+    // 2) NUMERIC FALLBACK (robust to dotted inputs)
+    //    We match in both directions:
+    //    - normalized_code LIKE 'userDigits%' (user typed shorter prefix)
+    //    - normalized_code IN (first 4/6/8/10 digits of userDigits) (user typed longer dotted code)
+    if (numeric && userDigits) {
+      const prefixParts = [4, 6, 8, 10]
+        .filter((k) => userDigits.length >= k)
+        .map((k) => userDigits.slice(0, k));
+      const uniqParts = Array.from(new Set(prefixParts));
+
+      // Build PostgREST .or() clause
+      const inList = uniqParts.length
+        ? `,normalized_code.in.(${uniqParts.map((p) => `"${p}"`).join(',')})`
+        : '';
+      const orFilter = `normalized_code.like.${userDigits}%${inList}`;
+
+      const { data: numAliases, error: numErr } = await sb
+        .from('hs_aliases_data')
+        .select('hs_code, description')
+        .or(orFilter)
+        .limit(200);
+
+      if (!numErr && numAliases && numAliases.length > 0) {
+        // score deeper matches higher
+        const best = new Map<string, { desc: string; score: number }>();
+        for (const r of numAliases) {
+          const code = String((r as any).hs_code || '');
+          const storedDigits = code.replace(/\D/g, '');
+
+          let score = 0.5;
+          if (userDigits.startsWith(storedDigits)) {
+            // user typed more specific code than we store
+            if (storedDigits.length >= 10) score = 1.0;
+            else if (storedDigits.length >= 8) score = 0.9;
+            else if (storedDigits.length >= 6) score = 0.8;
+            else score = 0.7; // 4-digit
+          } else if (storedDigits.startsWith(userDigits)) {
+            // user typed a shorter prefix
+            score = 0.85;
+          }
+
+          const prev = best.get(code);
+          if (!prev || score > prev.score) {
+            best.set(code, { desc: (r as any).description || '', score });
+          }
+        }
+
+        const ordered = [...best.entries()].sort((a, b) => b[1].score - a[1].score).slice(0, LIMIT);
+
+        const hits = ordered.map(([code, v]) =>
+          shapeHit({ code, description: v.desc || '' }, v.score, 'alias:code-prefix'),
+        );
+
+        return NextResponse.json({ hits, q: qRaw });
+      }
+    }
+
+    // 3) KEYWORD FALLBACK (std view)
+    const { data: kwStd, error: kwErr } = await sb
       .from('hts_lines_std')
       .select('hs_code, description')
       .ilike('description', `%${qRaw}%`)
-      .limit(limit);
+      .limit(LIMIT);
 
-    if (kwStdErr) {
-      console.error('hts_lines_std fallback error:', kwStdErr);
-    }
-
-    if (kwStd && kwStd.length > 0) {
-      const codes = Array.from(new Set(kwStd.map((r: any) => r.hs_code)));
-      const { data: fullRows, error: fullErr } = await sb
+    if (!kwErr && kwStd && kwStd.length > 0) {
+      const codes = Array.from(new Set((kwStd as any[]).map((r) => r.hs_code)));
+      const { data: fullRows } = await sb
         .from('hts_lines')
         .select('code,code_len,description,mfn_advalorem,mfn_specific,rev_number,rev_date,hts10')
         .in('code', codes);
-
-      if (fullErr) {
-        console.error('enrich (fallback) hts_lines error:', fullErr);
-      }
 
       const byCode = new Map<string, FullRow>();
       (fullRows || []).forEach((r) => byCode.set(r.code, r as FullRow));
@@ -146,18 +182,18 @@ export async function GET(req: NextRequest) {
           byCode.get(code) ||
           ({
             code,
-            description: kwStd.find((k: any) => k.hs_code === code)?.description ?? '',
+            description: (kwStd as any[]).find((k) => k.hs_code === code)?.description ?? '',
           } as Partial<FullRow>);
         const contains = (row.description || '').toLowerCase().includes(qLower);
-        const confidence = contains ? Math.min(0.6 + qLower.length / 40, 0.9) : 0.5;
-        const reason = contains ? 'Keyword contained in description' : 'Keyword partial match';
+        const confidence = contains ? 0.6 : 0.45;
+        const reason = contains ? 'keyword in description' : 'keyword partial';
         return shapeHit(row, confidence, reason);
       });
 
       return NextResponse.json({ hits, q: qRaw });
     }
 
-    // 3) Nothing found
+    // 4) Nothing
     return NextResponse.json({ hits: [], q: qRaw });
   } catch (e: any) {
     console.error(e);
