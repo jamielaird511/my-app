@@ -4,8 +4,10 @@
 import React, { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import CountrySelect from '@/components/CountrySelect';
+import RefineModal from '@/components/RefineModal';
 import { findCountryByCode } from '@/lib/countries';
 import { logEvent } from '@/lib/analytics'; // 🔹 tracking
+import { useRefineCandidates } from '@/hooks/useRefineCandidates';
 
 // --- debug helper (toggle on/off) ---
 const DEBUG = false;
@@ -201,21 +203,46 @@ function formatHsCode(code: string): string {
   if (digits.length === 6) return digits.replace(/(\d{4})(\d{2})/, '$1.$2');
   if (digits.length === 8) return digits.replace(/(\d{4})(\d{2})(\d{2})/, '$1.$2.$3');
   if (digits.length === 10) return digits.replace(/(\d{4})(\d{2})(\d{4})/, '$1.$2.$3');
+  if (digits.length === 4) return digits; // fallback (shouldn't happen in results)
   return code;
 }
+
+/** Normalize user input to 6/8/10 digits.
+ *  - If 4 digits are entered, pad to 6 by appending '00'.
+ *  - Strip non-digits, cap at 10 digits; if >10, take first 6 + last 4 (keeps subheading + suffix).
+ */
 function sanitizeHS(raw: string) {
   const groups = raw.match(/\d+/g) || [];
-  const digits = groups.join('');
+  let digits = groups.join('');
+
+  // 🔹 Auto-pad 4-digit headings to 6 digits
+  if (digits.length === 4) digits = digits + '00';
+
   if (digits.length <= 10) return digits;
+
   const first6 = digits.slice(0, 6);
   const last4 = digits.slice(-4);
   const candidate = `${first6}${last4}`;
   if (candidate.length === 10) return candidate;
   return digits.slice(0, 10);
 }
+
+// After sanitization, we accept exactly 6, 8 or 10 digits
 function isValidHS(raw: string) {
   const d = sanitizeHS(raw);
   return d.length === 6 || d.length === 8 || d.length === 10;
+}
+
+// Prefer the most specific HS (longest 6/8/10 digits) for display
+function preferMoreSpecificHs(view: ViewModel, usedCode: string): ViewModel {
+  const v: ViewModel = JSON.parse(JSON.stringify(view));
+  const used = sanitizeHS(usedCode);
+  const existing = (v.breakdown.hsCode || '').replace(/\D/g, '');
+  if (used && (existing.length === 0 || used.length > existing.length)) {
+    v.breakdown.hsCode = used;
+    v.breakdown.hsCodeFormatted = formatHsCode(used);
+  }
+  return v;
 }
 
 /* -----------------------
@@ -535,10 +562,14 @@ function EstimateClient() {
   const [view, setView] = useState<ViewModel | null>(null);
   const [calcTime, setCalcTime] = useState<string>('');
 
+  // Refine functionality
+  const { candidates, loading: refineLoading, openRefine, closeRefine, isOpen: refineIsOpen } = useRefineCandidates();
+
   const priceNum = useMemo(() => Number(price), [price]);
   const qtyNum = useMemo(() => (qty === '' ? null : Number(qty)), [qty]);
   const weightNum = useMemo(() => (weightKg === '' ? null : Number(weightKg)), [weightKg]);
 
+  // 🔹 Sanitized HS (pads 4->6)
   const hsDigits = useMemo(() => sanitizeHS(hsInput), [hsInput]);
   const hsValid = useMemo(() => isValidHS(hsInput), [hsInput]);
 
@@ -556,18 +587,21 @@ function EstimateClient() {
   // 🔹 FIRE estimator_loaded once (if a code is present on entry)
   useEffect(() => {
     const initial = (preHs || '').replace(/\D/g, '').slice(0, 10);
-    if (initial && initial.length >= 6) {
-      logEvent({
-        event_type: 'estimator_loaded',
-        estimator_loaded: true,
-        clicked_code: initial,
-      });
+    if (initial) {
+      const normalized = sanitizeHS(preHs);
+      if (normalized && normalized.length >= 6) {
+        logEvent({
+          event_type: 'estimator_loaded',
+          estimator_loaded: true,
+          clicked_code: normalized,
+        });
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Track HS changes (avoid spamming by keeping last sent)
-  const lastReportedHs = useRef<string>((preHs || '').replace(/\D/g, '').slice(0, 10));
+  const lastReportedHs = useRef<string>(sanitizeHS(preHs || '').slice(0, 10));
   const handleHsChange = (next: string) => {
     setHsInput(next);
     if (preHs) setPrefilledDesc('');
@@ -586,7 +620,8 @@ function EstimateClient() {
       setHsInput(preHs);
       if (preDesc) setPrefilledDesc(preDesc);
       setTimeout(() => priceInputRef.current?.focus(), 50);
-      if (preSource) setToast({ kind: 'success', msg: `HS ${formatHsCode(preHs)} prefilled` });
+      if (preSource)
+        setToast({ kind: 'success', msg: `HS ${formatHsCode(sanitizeHS(preHs))} prefilled` });
       focusedFromPrefill.current = true;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -638,7 +673,7 @@ function EstimateClient() {
         weightKg: weightNum ?? undefined,
       };
 
-      let code = hsDigits;
+      let code = hsDigits; // 🔹 already pads 4->6
       dbg('submit->start', {
         hsDigits: code,
         countryCode,
@@ -659,6 +694,9 @@ function EstimateClient() {
         qty: qtyNum,
         weightKg: weightNum ?? undefined,
       });
+      // 🔹 Prefer the exact code used for calc, if more specific
+      normalized = preferMoreSpecificHs(normalized, code);
+
       dbg('submit->normalized', {
         hs: normalized.breakdown.hsCode,
         country: normalized.breakdown.country,
@@ -742,6 +780,8 @@ function EstimateClient() {
           qty: qtyNum,
           weightKg: weightNum ?? undefined,
         });
+        normalized = preferMoreSpecificHs(normalized, usedCode);
+
         dbg('auto->normalized', {
           hs: normalized.breakdown.hsCode,
           rate: normalized.rate,
@@ -817,6 +857,7 @@ function EstimateClient() {
         qty: qtyNum,
         weightKg: weightNum ?? undefined,
       });
+      normalized = preferMoreSpecificHs(normalized, usedCode);
 
       if (normalized.rate == null || normalized.resolution === 'none') {
         normalized = await enrichFromHsSearch(normalized, usedCode);
@@ -874,7 +915,7 @@ function EstimateClient() {
 
         {(preSource === 'landing' || preSource === 'manual') && preHs && (
           <div className="mb-4 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm text-indigo-900">
-            HS code <span className="font-mono">{formatHsCode(preHs)}</span> prefilled
+            HS code <span className="font-mono">{formatHsCode(sanitizeHS(preHs))}</span> prefilled
             {prefilledDesc ? ` — ${prefilledDesc}` : ''}.
           </div>
         )}
@@ -1048,6 +1089,59 @@ function EstimateClient() {
                     (view.breakdown.hsCode ? formatHsCode(view.breakdown.hsCode) : '—')}
                 </span>
                 {view.breakdown.description ? <> — {view.breakdown.description}</> : null}
+                {/* Precision hint: always 6+ now (4-digit is padded) */}
+                {(() => {
+                  const hsCode = view.breakdown.hsCode;
+                  const hsDigits = hsCode ? hsCode.replace(/\D/g, '') : '';
+                  const shouldShowRefine = hsCode && hsDigits.length < 10;
+                  console.log('HS Code debug:', { hsCode, hsDigits, length: hsDigits.length, shouldShowRefine });
+                  return shouldShowRefine;
+                })() && (
+                  <div className="mt-2 p-2 bg-blue-50 border border-blue-200 rounded-lg">
+                    <div className="text-sm text-blue-800 mb-2">
+                      💡 For the most accurate duty rate, refine to a 10-digit HTSUS code:
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        // take whatever we have on the view, sanitize it like the estimator does
+                        const raw = String(view.breakdown.hsCode || '');
+                        let seed = sanitizeHS(raw);        // pads 4→6 and strips non-digits
+
+                        // we only want a 6–8 digit seed for refinement
+                        if (seed.length > 8) seed = seed.slice(0, 8);
+
+                        console.log('Refine button clicked', { raw, seed, len: seed.length });
+
+                        if (seed.length >= 6 && seed.length <= 8) {
+                          openRefine(seed);
+                        } else {
+                          setToast({ kind: 'error', msg: 'Need a 6–8 digit HS to refine' });
+                        }
+                      }}
+                      className="w-full px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors font-medium"
+                    >
+                      🔍 Refine to 10-digit HS Code
+                    </button>
+                  </div>
+                )}
+                
+                {/* Debug button - always visible for testing */}
+                <div className="mt-2 p-2 bg-gray-50 border border-gray-200 rounded-lg">
+                  <div className="text-sm text-gray-800 mb-2">
+                    🧪 Debug: Test refine functionality
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      console.log('Debug refine button clicked');
+                      openRefine('640411');
+                    }}
+                    className="w-full px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 transition-colors font-medium"
+                  >
+                      🧪 Test Refine (640411)
+                  </button>
+                </div>
               </div>
               <div>
                 Country of origin:{' '}
@@ -1159,6 +1253,31 @@ function EstimateClient() {
       </div>
 
       {toast && <Toast kind={toast.kind} message={toast.msg} onClose={() => setToast(null)} />}
+
+      {/* Refine Modal */}
+      <RefineModal
+        isOpen={refineIsOpen}
+        onClose={closeRefine}
+        candidates={candidates}
+        loading={refineLoading}
+        onSelectCandidate={(candidate) => {
+          // Track selection
+          logEvent({
+            event_type: 'refine_selected',
+            hs6: (view?.breakdown.hsCode || '').replace(/\D/g, '').slice(0, 6),
+            code10: candidate.code10,
+            confidence: candidate.confidence,
+          });
+          
+          // Update HS input and re-run estimate
+          setHsInput(candidate.code10);
+          setPrefilledDesc(candidate.description);
+          
+          // Close modal and trigger estimate
+          closeRefine();
+          handleEstimate(new Event('submit') as any);
+        }}
+      />
 
       <style jsx global>{`
         @media print {

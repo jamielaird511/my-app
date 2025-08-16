@@ -1,0 +1,7 @@
+Act as a senior engineer. Before edits:
+1) Propose a plan (files, scope, risks, test plan).
+2) Keep scope ≤5 files, ≤300 LOC.
+3) No client/server mixing; pages < 250 LOC.
+4) Strong typing; validate API inputs with Zod.
+5) Non-UI logic → `/lib/estimate/*` with tests.
+6) Update ARCHITECTURE.md and STATUS.md when structure changes.

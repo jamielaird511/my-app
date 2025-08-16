@@ -78,11 +78,22 @@ const codeIsValid = (code: string) => {
   const len = hsDigitsFrom(code).length;
   return len >= 4 && len <= 10;
 };
-// Pad 4-digit headings to 6 digits for estimator
-function normalizeHsCode(code: string) {
-  let digits = hsDigitsFrom(code);
-  if (digits.length === 4) digits = digits + '00';
-  return digits;
+// Normalize for estimator + meta
+function normalizeHsCodeWithMeta(code: string) {
+  const original = hsDigitsFrom(code);
+  let digits = original;
+  let padded_from: 4 | null = null;
+  if (digits.length === 4) {
+    digits = digits + '00'; // pad 4->6
+    padded_from = 4;
+  }
+  const meta = {
+    hs: digits,
+    hs_len: digits.length,
+    needs_refine: digits.length < 10 ? '1' : '0', // flag for banner
+    padded_from, // null or 4
+  };
+  return meta;
 }
 
 export default function HomePage() {
@@ -132,27 +143,44 @@ export default function HomePage() {
     }
   };
 
-  // Pass digits-only HS to estimator (normalize 4->6)
-  const selectCode = async (s: Suggestion) => {
-    const hsDigits = normalizeHsCode(s.code);
-    if (!hsDigits || hsDigits.length < 6) return;
-    await logEvent({ event_type: 'result_clicked', clicked_code: hsDigits });
-
+  // Route with precision flags
+  const routeToEstimator = (opts: {
+    hs: string;
+    hs_display?: string;
+    desc?: string;
+    padded_from: 4 | null;
+  }) => {
     const params = new URLSearchParams();
-    params.set('hs', hsDigits);
-    params.set('hs_display', s.code);
-    params.set('desc', s.description);
+    params.set('hs', opts.hs);
+    if (opts.hs_display) params.set('hs_display', opts.hs_display);
+    if (opts.desc) params.set('desc', opts.desc);
     params.set('source', 'landing');
+
+    // Precision metadata for estimator banner
+    params.set('hs_len', String(opts.hs.length));
+    if (opts.padded_from) params.set('padded_from', String(opts.padded_from));
+    if (opts.hs.length < 10) params.set('needs_refine', '1');
+
     router.push(`/estimate?${params.toString()}`);
   };
 
+  // Pass digits-only HS to estimator (normalize 4->6) + meta
+  const selectCode = async (s: Suggestion) => {
+    const meta = normalizeHsCodeWithMeta(s.code);
+    if (!meta.hs || meta.hs.length < 6) return;
+    await logEvent({ event_type: 'result_clicked', clicked_code: meta.hs });
+    routeToEstimator({
+      hs: meta.hs,
+      hs_display: s.code,
+      desc: s.description,
+      padded_from: meta.padded_from,
+    });
+  };
+
   const goManual = () => {
-    const hs = normalizeHsCode(manualHs);
-    if (!hs || hs.length < 6) return;
-    const params = new URLSearchParams();
-    params.set('hs', hs);
-    params.set('source', 'manual');
-    router.push(`/estimate?${params.toString()}`);
+    const meta = normalizeHsCodeWithMeta(manualHs);
+    if (!meta.hs || meta.hs.length < 6) return;
+    routeToEstimator({ hs: meta.hs, padded_from: meta.padded_from });
   };
 
   return (
@@ -204,8 +232,7 @@ export default function HomePage() {
                     {suggestions.map((s) => {
                       const isValid = codeIsValid(s.code);
                       const activate = () => {
-                        if (!isValid) return;
-                        selectCode(s);
+                        if (isValid) selectCode(s);
                       };
 
                       return (

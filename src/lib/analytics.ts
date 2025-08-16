@@ -80,7 +80,9 @@ export type EventType =
   | 'origin_selected'
   | 'alternate_selected'
   | 'de_minimis_applied'
-  | 'estimator_error';
+  | 'estimator_error'
+  | 'refine_opened'
+  | 'refine_selected';
 
 export type EventPayload = {
   event_type: EventType;
@@ -110,6 +112,11 @@ export type EventPayload = {
   // misc flags
   estimator_loaded?: boolean;
   code_changed?: boolean;
+
+  // refine events
+  hs6?: string;
+  code10?: string;
+  confidence?: number;
 
   // errors / stages
   error_message?: string;
