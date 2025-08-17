@@ -1,202 +1,190 @@
-// src/app/api/hs/search/route.ts
-import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
+import { NextResponse } from 'next/server';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import Fuse from 'fuse.js';
+import { ALIASES } from '@/data/aliases';
 
-export const dynamic = 'force-dynamic';
+export const runtime = 'nodejs';
 
-// ---- Supabase (server-only) ----
-const url = (process.env.NEXT_PUBLIC_SUPABASE_URL || '').trim();
-const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
-if (!url || !key) {
-  throw new Error('Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+type Row = { code10: string; description: string; aliases?: string[] };
+
+let DATA: Row[] | null = null;
+let FUSE: Fuse<Row> | null = null;
+
+const to10 = (s: string) => (s || '').replace(/\D/g, '').slice(0, 10);
+
+async function ensureLoaded() {
+  if (DATA && FUSE) return;
+  const file = path.join(process.cwd(), 'public', 'hts10.json');
+  const json = await fs.readFile(file, 'utf8');
+  const raw = JSON.parse(json) as any[];
+
+  // Canonicalize rows; accept {code10} or {code}
+  const base: Row[] = raw
+    .map((r) => {
+      const code10 = to10(String(r.code10 ?? r.code ?? ''));
+      const description = String(r.description ?? r.desc ?? '');
+      const aliases = Array.isArray(r.aliases) ? r.aliases.map(String) : [];
+      return code10.length === 10 ? { code10, description, aliases } : null;
+    })
+    .filter(Boolean) as Row[];
+
+  // Merge alias registry by injecting synonyms into likely prefixes
+  const rowsByPrefix = new Map<string, Row[]>();
+  for (const r of base) {
+    const p4 = r.code10.slice(0, 4);
+    const p6 = r.code10.slice(0, 6);
+    (rowsByPrefix.get(p4) ?? rowsByPrefix.set(p4, []).get(p4)!).push(r);
+    (rowsByPrefix.get(p6) ?? rowsByPrefix.set(p6, []).get(p6)!).push(r);
+  }
+  for (const a of ALIASES) {
+    const words = new Set<string>([
+      a.term.toLowerCase(),
+      ...(a.synonyms ?? []).map((x) => x.toLowerCase()),
+    ]);
+    const prefixes = a.hintPrefixes ?? [];
+    for (const pref of prefixes) {
+      const bucket = rowsByPrefix.get(pref) ?? [];
+      for (const row of bucket) {
+        const merged = new Set([...(row.aliases || []), ...Array.from(words)]);
+        row.aliases = Array.from(merged);
+      }
+    }
+  }
+
+  DATA = base;
+  FUSE = new Fuse(DATA, {
+    includeScore: true,
+    threshold: 0.34, // fairly strict; tune later
+    ignoreLocation: true,
+    keys: [
+      { name: 'description', weight: 0.7 },
+      { name: 'aliases',     weight: 0.2 },
+      { name: 'code10',      weight: 0.1 },
+    ],
+  });
 }
-const sb = createClient(url, key, { auth: { persistSession: false } });
 
-// ---- Types / helpers ----
-type FullRow = {
-  code: string;
-  code_len: number | null;
-  description: string | null;
-  mfn_advalorem: number | null;
-  mfn_specific: string | null;
-  rev_number: string | null;
-  rev_date: string | null;
-  hts10?: string | null;
-};
+export async function GET(req: Request) {
+  const url = new URL(req.url);
+  const q = (url.searchParams.get('q') || '').trim();
+  if (!q) return NextResponse.json({ hits: [] });
 
-function shapeHit(row: Partial<FullRow>, confidence: number, reason: string) {
-  return {
-    code: row.code || '',
-    code_len: row.code_len ?? null,
-    description: row.description ?? '',
-    mfn_advalorem: row.mfn_advalorem ?? null,
-    mfn_specific: row.mfn_specific ?? null,
-    rev_number: row.rev_number ?? null,
-    rev_date: row.rev_date ?? null,
-    confidence, // 0..1
-    reason,
-  };
-}
+  await ensureLoaded();
 
-function isNumericHS(q: string) {
+  // Prefix logic for digits: prefer children when 4/6/8 provided
   const digits = q.replace(/\D/g, '');
-  // accept 4/6/8/10 so dotted inputs resolve (e.g., 6404.00, 6404.00.0000)
-  return [4, 6, 8, 10].includes(digits.length);
+  let hits: Row[] = [];
+  if (digits.length >= 4) {
+    const prefix =
+      digits.length >= 8 ? digits.slice(0, 8) :
+      digits.length >= 6 ? digits.slice(0, 6) :
+      digits.slice(0, 4);
+    const pref = DATA!.filter((r) => r.code10.startsWith(prefix));
+    hits = pref.slice(0, 50);
+  }
+
+  // Alias-prefix fallback: if text matches a known alias term/synonym,
+  // include rows under its hintPrefixes (even if we didn't inject aliases).
+  const textLower = q.replace(/\d/g, '').trim().toLowerCase();
+  let matchedAliases: any[] = [];
+  if (textLower) {
+    matchedAliases = ALIASES.filter(a => {
+      if (a.term.toLowerCase() === textLower) return true;
+      return (a.synonyms ?? []).some(s => s.toLowerCase() === textLower);
+    });
+
+    if (matchedAliases.length) {
+      const prefixes = new Set<string>();
+      for (const a of matchedAliases) for (const p of (a.hintPrefixes ?? [])) prefixes.add(p);
+      if (prefixes.size) {
+        const aliasRows = DATA!.filter(r => {
+          const p4 = r.code10.slice(0, 4);
+          const p6 = r.code10.slice(0, 6);
+          return prefixes.has(p4) || prefixes.has(p6);
+        }).slice(0, 50);
+        // merge uniquely (keep any prefix-digit matches first)
+        const seen = new Set(hits.map(h => h.code10));
+        for (const r of aliasRows) if (!seen.has(r.code10)) { hits.push(r); seen.add(r.code10); }
+      }
+    }
+  }
+
+  const aliasForceRefine = matchedAliases.some(a => a.forceRefine);
+
+  // Text search via Fuse (aliases + description)
+  const text = q.replace(/\d/g, '').trim();
+  if (text) {
+    const fuseRes = FUSE!.search(text, { limit: 50 }).map((r) => r.item);
+    const seen = new Set(hits.map((h) => h.code10));
+    for (const r of fuseRes) {
+      if (!seen.has(r.code10)) {
+        hits.push(r);
+        seen.add(r.code10);
+      }
+    }
+  }
+
+  // Global heuristics for generic queries (broad, ambiguous, or risky)
+  function hasDifferent4Prefixes(rows: Row[]) {
+    const set = new Set(rows.slice(0, 3).map(r => r.code10.slice(0, 4)));
+    return set.size >= 2;
+  }
+
+  const noSpecificDigits = digits.length > 0 && digits.length < 6; // e.g. "64", "640"
+  const noDigitsAndShortVagueText = digits.length === 0 && textLower && textLower.split(/\s+/).length <= 2;
+  const topIsRisky = hits.length > 0 && (
+    /(^|\W)other(\W|$)|\bnesoi\b/i.test(hits[0].description) ||
+    /valued over|valued not over|value/i.test(hits[0].description)
+  );
+  const divergentTop = hasDifferent4Prefixes(hits);
+
+  const isGeneric =
+    aliasForceRefine ||
+    noSpecificDigits ||
+    (noDigitsAndShortVagueText && divergentTop) ||
+    (topIsRisky && !/\b(cotton|synthetic|leather|wool|men|women|boys|girls|sports|dress|running|tennis|value|over|under)\b/i.test(textLower || ''));
+
+/* BEGIN REPLACEMENT for output mapping in route.ts */
+
+function flagsFor(desc: string) {
+  const d = (desc || '').toLowerCase();
+  const flags: string[] = [];
+  if (/(^|\W)other(\W|$)|\bnesoi\b/.test(d)) flags.push('other-bucket');
+  if (/(valued over|valued not over|value)/.test(d)) flags.push('value-bracket');
+  if (/\bmen('|')?s|\bboys'?/.test(d)) flags.push('gender-male');
+  if (/\bwomen('|')?s|\bgirls'?/.test(d)) flags.push('gender-female');
+  if (/\bcotton\b/.test(d)) flags.push('material-cotton');
+  if (/(man-made|synthetic)/.test(d)) flags.push('material-synthetic');
+  return flags;
 }
 
-export async function GET(req: NextRequest) {
-  const urlObj = new URL(req.url);
-  const qRaw = (urlObj.searchParams.get('q') || '').trim();
-  const limitReq = parseInt(urlObj.searchParams.get('limit') || '4', 10);
-  const LIMIT = Math.max(1, Math.min(limitReq || 4, 10));
+// confidence heuristic based on any digits the user typed
+// we already computed `digits` earlier in this function
+function confFor(code10: string, digits: string) {
+  if (!digits) return 0.8;
+  if (digits.length >= 8 && code10.startsWith(digits.slice(0, 8))) return 0.92;
+  if (digits.length >= 6 && code10.startsWith(digits.slice(0, 6))) return 0.9;
+  if (digits.length >= 4 && code10.startsWith(digits.slice(0, 4))) return 0.85;
+  return 0.8;
+}
 
-  if (!qRaw) {
-    return NextResponse.json({ hits: [], q: qRaw, meta: { reason: 'empty query' } });
-  }
+// assume confFor(code10, digits) and flagsFor(desc) already exist above
+const baseConf = (code10: string) => confFor(code10, digits);
+const confWithGeneric = (code10: string) => isGeneric ? Math.min(0.6, baseConf(code10)) : baseConf(code10);
 
-  const userDigits = qRaw.replace(/\D/g, '');
-  const numeric = isNumericHS(qRaw);
+const out = hits.slice(0, 25).map((r) => ({
+  code: r.code10,
+  code10: r.code10,
+  description: r.description,
+  confidence: confWithGeneric(r.code10),     // 0..1
+  flags: [
+    ...flagsFor(r.description),
+    ...(isGeneric ? ['generic-query'] : [])
+  ],
+  forceRefine: isGeneric || undefined
+}));
 
-  try {
-    // 1) PRIMARY: RPC (unified fuzzy + numeric)
-    try {
-      const { data: rpcData, error: rpcErr } = await sb.rpc('hs_search_unified', {
-        p_query: qRaw,
-        p_digits: userDigits,
-        p_is_numeric: numeric,
-        p_limit: LIMIT,
-      });
-
-      if (!rpcErr && rpcData && rpcData.length > 0) {
-        const seen = new Set<string>();
-        const ordered = (rpcData as any[]).filter((r) => {
-          const code = String(r.hs_code || '');
-          if (!code || seen.has(code)) return false;
-          seen.add(code);
-          return true;
-        });
-
-        const codes = ordered.map((r) => String(r.hs_code));
-        const { data: fullRows } = await sb
-          .from('hts_lines')
-          .select('code,code_len,description,mfn_advalorem,mfn_specific,rev_number,rev_date,hts10')
-          .in('code', codes);
-
-        const byCode = new Map<string, FullRow>();
-        (fullRows || []).forEach((r) => byCode.set(r.code, r as FullRow));
-
-        const hits = ordered.map((r: any) => {
-          const code = String(r.hs_code);
-          const base: Partial<FullRow> = byCode.get(code) || {
-            code,
-            description: r.description ?? '',
-          };
-          const conf = Math.max(0, Math.min(1, Number(r.score ?? 0)));
-          const reason = r.reason ? String(r.reason) : numeric ? 'numeric match' : 'fuzzy match';
-          return shapeHit(base, conf, reason);
-        });
-
-        return NextResponse.json({ hits, q: qRaw });
-      }
-    } catch (e) {
-      console.error('hs_search_unified RPC error:', e);
-    }
-
-    // 2) NUMERIC FALLBACK (robust to dotted inputs)
-    //    We match in both directions:
-    //    - normalized_code LIKE 'userDigits%' (user typed shorter prefix)
-    //    - normalized_code IN (first 4/6/8/10 digits of userDigits) (user typed longer dotted code)
-    if (numeric && userDigits) {
-      const prefixParts = [4, 6, 8, 10]
-        .filter((k) => userDigits.length >= k)
-        .map((k) => userDigits.slice(0, k));
-      const uniqParts = Array.from(new Set(prefixParts));
-
-      // Build PostgREST .or() clause
-      const inList = uniqParts.length
-        ? `,normalized_code.in.(${uniqParts.map((p) => `"${p}"`).join(',')})`
-        : '';
-      const orFilter = `normalized_code.like.${userDigits}%${inList}`;
-
-      const { data: numAliases, error: numErr } = await sb
-        .from('hs_aliases_data')
-        .select('hs_code, description')
-        .or(orFilter)
-        .limit(200);
-
-      if (!numErr && numAliases && numAliases.length > 0) {
-        // score deeper matches higher
-        const best = new Map<string, { desc: string; score: number }>();
-        for (const r of numAliases) {
-          const code = String((r as any).hs_code || '');
-          const storedDigits = code.replace(/\D/g, '');
-
-          let score = 0.5;
-          if (userDigits.startsWith(storedDigits)) {
-            // user typed more specific code than we store
-            if (storedDigits.length >= 10) score = 1.0;
-            else if (storedDigits.length >= 8) score = 0.9;
-            else if (storedDigits.length >= 6) score = 0.8;
-            else score = 0.7; // 4-digit
-          } else if (storedDigits.startsWith(userDigits)) {
-            // user typed a shorter prefix
-            score = 0.85;
-          }
-
-          const prev = best.get(code);
-          if (!prev || score > prev.score) {
-            best.set(code, { desc: (r as any).description || '', score });
-          }
-        }
-
-        const ordered = [...best.entries()].sort((a, b) => b[1].score - a[1].score).slice(0, LIMIT);
-
-        const hits = ordered.map(([code, v]) =>
-          shapeHit({ code, description: v.desc || '' }, v.score, 'alias:code-prefix'),
-        );
-
-        return NextResponse.json({ hits, q: qRaw });
-      }
-    }
-
-    // 3) KEYWORD FALLBACK (std view)
-    const { data: kwStd, error: kwErr } = await sb
-      .from('hts_lines_std')
-      .select('hs_code, description')
-      .ilike('description', `%${qRaw}%`)
-      .limit(LIMIT);
-
-    if (!kwErr && kwStd && kwStd.length > 0) {
-      const codes = Array.from(new Set((kwStd as any[]).map((r) => r.hs_code)));
-      const { data: fullRows } = await sb
-        .from('hts_lines')
-        .select('code,code_len,description,mfn_advalorem,mfn_specific,rev_number,rev_date,hts10')
-        .in('code', codes);
-
-      const byCode = new Map<string, FullRow>();
-      (fullRows || []).forEach((r) => byCode.set(r.code, r as FullRow));
-
-      const qLower = qRaw.toLowerCase();
-      const hits = codes.map((code) => {
-        const row =
-          byCode.get(code) ||
-          ({
-            code,
-            description: (kwStd as any[]).find((k) => k.hs_code === code)?.description ?? '',
-          } as Partial<FullRow>);
-        const contains = (row.description || '').toLowerCase().includes(qLower);
-        const confidence = contains ? 0.6 : 0.45;
-        const reason = contains ? 'keyword in description' : 'keyword partial';
-        return shapeHit(row, confidence, reason);
-      });
-
-      return NextResponse.json({ hits, q: qRaw });
-    }
-
-    // 4) Nothing
-    return NextResponse.json({ hits: [], q: qRaw });
-  } catch (e: any) {
-    console.error(e);
-    return NextResponse.json({ error: e?.message || 'search failed' }, { status: 500 });
-  }
+return NextResponse.json({ hits: out });
+/* END REPLACEMENT for output mapping in route.ts */
 }

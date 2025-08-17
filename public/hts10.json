@@ -3,5 +3,9 @@
   { "code10": "6404111000", "description": "Tennis shoes, basketball shoes, gym shoes, training shoes and the like" },
   { "code10": "6404112000", "description": "Footwear for other sports" },
   { "code10": "6404113060", "description": "Other; valued over $3 but not over $6.50/pair" },
-  { "code10": "6404115090", "description": "Other; valued over $6.50/pair" }
+  { "code10": "6404115090", "description": "Other; valued over $6.50/pair" },
+  { "code10": "6110201020", "description": "Sweaters, pullovers, sweatshirts and the like, of cotton, women's or girls'" },
+  { "code10": "6110202025", "description": "Sweaters, pullovers, sweatshirts and the like, of man-made fibers, men's or boys', other" },
+  { "code10": "6110303050", "description": "Sweaters, pullovers, sweatshirts and the like, of man-made fibers, women's or girls', other" },
+  { "code10": "6101302000", "description": "Men's or boys' overcoats, anoraks (including ski-jackets), wind-cheaters and similar articles, of man-made fibers, knitted" }
 ]

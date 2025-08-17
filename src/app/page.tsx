@@ -5,6 +5,7 @@ import { useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { logEvent } from '@/lib/analytics';
+import RefineModal from '@/components/RefineModal';
 
 /* Icons */
 function IconCalc(props: React.SVGProps<SVGSVGElement>) {
@@ -104,6 +105,17 @@ export default function HomePage() {
   const [error, setError] = useState<string | null>(null);
   const [manualOpen, setManualOpen] = useState(false);
   const [manualHs, setManualHs] = useState('');
+  const [showRefine, setShowRefine] = useState(false);
+
+  function handleUseCodeFromLanding(codeLike: string, description?: string) {
+    const hs = String(codeLike || '').replace(/\D/g, '').slice(0, 10);
+    if (!hs) return; // nothing to do
+    const params = new URLSearchParams();
+    params.set('hs', hs);
+    if (description) params.set('desc', description);
+    params.set('source', 'landing');
+    router.push(`/estimate?${params.toString()}`);
+  }
 
   const heroCtaDisabled = useMemo(() => query.trim().length === 0 || loading, [query, loading]);
 
@@ -281,25 +293,22 @@ export default function HomePage() {
                             <span className="text-[10px] text-slate-500">
                               {Math.round((s.confidence ?? 0.8) * 100)}% match
                             </span>
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                activate();
-                              }}
-                              disabled={!isValid}
-                              title={
-                                isValid ? 'Send to estimator' : 'Needs at least a 4-digit code'
-                              }
-                              className={[
-                                'rounded-lg px-3 py-1.5 text-xs font-medium',
-                                isValid
-                                  ? 'bg-indigo-600 text-white hover:bg-indigo-700'
-                                  : 'bg-slate-200 text-slate-500 cursor-not-allowed',
-                              ].join(' ')}
-                            >
-                              Use this code
-                            </button>
+                                                         <button
+                               type="button"
+                               onClick={() => handleUseCodeFromLanding(s.code, s.description)}
+                               disabled={!isValid}
+                               title={
+                                 isValid ? 'Send to estimator' : 'Needs at least a 4-digit code'
+                               }
+                               className={[
+                                 'rounded-lg px-3 py-1.5 text-xs font-medium',
+                                 isValid
+                                   ? 'bg-indigo-600 text-white hover:bg-indigo-700'
+                                   : 'bg-slate-200 text-slate-500 cursor-not-allowed',
+                               ].join(' ')}
+                             >
+                               Use this code
+                             </button>
                           </div>
                         </li>
                       );
@@ -485,6 +494,59 @@ export default function HomePage() {
           </div>
         </div>
       </footer>
+
+      {Array.isArray(suggestions) && suggestions.length > 1 && (
+        <>
+          <div className="mt-3 flex items-center gap-3">
+            <button
+              type="button"
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-gray-50"
+              onClick={() => setShowRefine(true)}
+            >
+              See other matches ({Math.max(0, (suggestions?.length ?? 0) - 1)})
+            </button>
+
+            {/* Risk nudges derived from API fields; safe-optional access so types don't break */}
+            {(() => {
+              const best: any = suggestions?.[0] ?? null;
+              const flags: string[] = (best?.flags ?? []) as string[];
+              const conf: number = typeof best?.confidence === 'number' ? best.confidence : 0.8;
+              const isGeneric = !!best?.forceRefine || flags.includes('generic-query');
+
+              if (isGeneric) {
+                return (
+                  <span className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                    Too broad — choose a type (material, use, value bracket, gender)
+                  </span>
+                );
+              }
+              if (conf < 0.9) {
+                return (
+                  <span className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                    Confidence {Math.round(conf * 100)}% — consider reviewing alternatives
+                  </span>
+                );
+              }
+              return null;
+            })()}
+          </div>
+
+          <RefineModal
+            isOpen={showRefine}
+            onClose={() => setShowRefine(false)}
+            candidates={(suggestions ?? []).slice(0, 5).map((r: any) => ({
+              code10: r.code10,
+              description: r.description,
+              confidence: typeof r.confidence === 'number' ? r.confidence : 0.8,
+            }))}
+            loading={false}
+            onSelectCandidate={(c) => {
+              setShowRefine(false);
+              handleUseCodeFromLanding(c.code10, c.description);
+            }}
+          />
+        </>
+      )}
     </main>
   );
 }
