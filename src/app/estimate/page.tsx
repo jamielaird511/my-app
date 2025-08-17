@@ -1085,8 +1085,9 @@ function EstimateClient() {
               <div>
                 HS code:{' '}
                 <span className="font-mono">
-                  {view.breakdown.hsCodeFormatted ||
-                    (view.breakdown.hsCode ? formatHsCode(view.breakdown.hsCode) : '—')}
+                  {hsInput ? formatHsCode(hsInput) : 
+                    (view.breakdown.hsCodeFormatted ||
+                    (view.breakdown.hsCode ? formatHsCode(view.breakdown.hsCode) : '—'))}
                 </span>
                 {view.breakdown.description ? <> — {view.breakdown.description}</> : null}
                 {/* Precision hint: always 6+ now (4-digit is padded) */}
