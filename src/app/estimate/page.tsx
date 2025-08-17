@@ -1127,22 +1127,24 @@ function EstimateClient() {
                   </div>
                 )}
                 
-                {/* Debug button - always visible for testing */}
-                <div className="mt-2 p-2 bg-gray-50 border border-gray-200 rounded-lg">
-                  <div className="text-sm text-gray-800 mb-2">
-                    🧪 Debug: Test refine functionality
+                {/* Debug button - only visible in development */}
+                {process.env.NODE_ENV !== "production" && (
+                  <div className="mt-2 p-2 bg-gray-50 border border-gray-200 rounded-lg">
+                    <div className="text-sm text-gray-800 mb-2">
+                      🧪 Debug: Test refine functionality
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        console.log('Debug refine button clicked');
+                        openRefine('640411');
+                      }}
+                      className="w-full px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 transition-colors font-medium"
+                    >
+                        🧪 Test Refine (640411)
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      console.log('Debug refine button clicked');
-                      openRefine('640411');
-                    }}
-                    className="w-full px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700 transition-colors font-medium"
-                  >
-                      🧪 Test Refine (640411)
-                  </button>
-                </div>
+                )}
               </div>
               <div>
                 Country of origin:{' '}
